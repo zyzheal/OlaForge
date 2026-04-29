@@ -1,0 +1,28 @@
+[workspace]
+members = [
+  "src/olaforge-core",
+  "src/olaforge-fs", 
+  "src/olaforge-executor",
+  "src/olaforge-sandbox",
+  "src/olaforge-evolution",
+  "src/olaforge-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "1.0.0"
+authors = ["OlaForge Team"]
+license = "MIT"
+repository = "https://github.com/zyzheal/OlaForge"
+homepage = "https://github.com/zyzheal/OlaForge"
+
+[workspace.dependencies]
+thiserror = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"

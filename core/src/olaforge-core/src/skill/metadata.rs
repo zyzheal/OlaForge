@@ -1,0 +1,966 @@
+use anyhow::Context;
+
+use crate::Result;
+use regex::Regex;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+use std::sync::LazyLock;
+
+// ─── Pre-compiled Regex statics ───────────────────────────────────────────────
+
+/// Fallback regex that never matches (used when a static pattern fails to compile).
+/// Uses `$^` (end then start) which is valid and matches no string.
+fn never_match_regex() -> Regex {
+    Regex::new("$^").unwrap_or_else(|_| unreachable!("$^ is valid"))
+}
+
+/// Matches YAML continuation lines: newline + indent + colon + space.
+static YAML_CONTINUATION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n(\s+):(\s+)").unwrap_or_else(|_| never_match_regex()));
+
+/// Matches YAML front matter between --- delimiters (dotall mode).
+static YAML_FRONT_MATTER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)^---\s*\n(.*?)\n---").unwrap_or_else(|_| never_match_regex())
+});
+
+/// Matches `Bash(...)` patterns inside allowed_tools strings.
+static ALLOWED_TOOLS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Bash\(([^)]+)\)").unwrap_or_else(|_| never_match_regex()));
+
+/// Front matter data (official Agent Skills fields per Claude specification)
+/// See: https://docs.anthropic.com/en/docs/agents-and-tools/agent-skills/specification
+#[derive(Deserialize, Debug, Clone, Default)]
+#[allow(dead_code)]
+struct FrontMatter {
+    /// Required: Skill name (max 64 chars, lowercase + hyphens only)
+    #[serde(default)]
+    pub name: String,
+
+    /// Required: Description of what the skill does (max 1024 chars)
+    #[serde(default)]
+    pub description: Option<String>,
+
+    /// Optional: License name or reference
+    #[serde(default)]
+    pub license: Option<String>,
+
+    /// Optional: Environment requirements (max 500 chars)
+    /// Examples: "Requires Python 3.x, network access", "Requires git, docker"
+    #[serde(default)]
+    pub compatibility: Option<String>,
+
+    /// Optional: Entry script path (e.g. scripts/main.py). When set, this is the designated entry; must exist under skill dir.
+    #[serde(default)]
+    pub entry_point: Option<String>,
+
+    /// Optional: Additional metadata (author, version, etc.)
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+
+    /// Optional: Pre-approved tools (experimental)
+    #[serde(default, rename = "allowed-tools")]
+    pub allowed_tools: Option<String>,
+
+    /// Optional: Whether skill requires elevated permissions (e.g. full filesystem)
+    #[serde(default, rename = "requires_elevated_permissions")]
+    pub requires_elevated_permissions: Option<bool>,
+
+    /// Optional: Capability tags for P2P discovery and task routing.
+    /// Examples: ["python", "web", "ml", "data"]
+    /// Can also be nested under `metadata.capabilities` for backward compat.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+/// Parsed pattern from `allowed-tools: Bash(agent-browser:*)`
+#[derive(Debug, Clone)]
+pub struct BashToolPattern {
+    /// Command prefix, e.g. "agent-browser"
+    pub command_prefix: String,
+    /// Raw pattern string, e.g. "agent-browser:*"
+    /// Used in validation error messages and audit logging.
+    pub raw_pattern: String,
+}
+
+/// Parse the `allowed-tools` field value into a list of bash tool patterns.
+///
+/// Examples:
+///   - `"Bash(agent-browser:*)"` -> `[BashToolPattern { command_prefix: "agent-browser", .. }]`
+///   - `"Bash(agent-browser:*), Bash(npm:*)"` -> two patterns
+///   - `"Read, Edit, Bash(mycli:*)"` -> one BashToolPattern (non-Bash tools ignored)
+pub fn parse_allowed_tools(raw: &str) -> Vec<BashToolPattern> {
+    let mut patterns = Vec::new();
+
+    for cap in ALLOWED_TOOLS_RE.captures_iter(raw) {
+        if let Some(inner) = cap.get(1) {
+            let pattern_str = inner.as_str().trim();
+            // Extract command prefix: everything before the first ':' or whitespace.
+            // e.g. "agent-browser:*" -> "agent-browser"
+            // e.g. "infsh *" -> "infsh"
+            // e.g. "agent-browser" -> "agent-browser"
+            let command_prefix = if let Some(idx) = pattern_str.find(':') {
+                pattern_str[..idx].trim().to_string()
+            } else {
+                pattern_str
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+
+            if !command_prefix.is_empty() {
+                patterns.push(BashToolPattern {
+                    command_prefix,
+                    raw_pattern: pattern_str.to_string(),
+                });
+            }
+        }
+    }
+
+    patterns
+}
+
+/// Skill metadata parsed from SKILL.md YAML front matter
+#[derive(Debug, Clone)]
+pub struct SkillMetadata {
+    /// Skill name
+    pub name: String,
+
+    /// Entry point script path (relative to skill directory)
+    pub entry_point: String,
+
+    /// Programming language: "python", "node", or "bash"
+    pub language: Option<String>,
+
+    /// Description of the skill
+    pub description: Option<String>,
+
+    /// Optional semantic version from SKILL.md front matter metadata.version
+    pub version: Option<String>,
+
+    /// Compatibility string (environment requirements)
+    pub compatibility: Option<String>,
+
+    /// Network policy configuration (derived from compatibility)
+    pub network: NetworkPolicy,
+
+    /// Resolved package list from .skilllite.lock (written by `skilllite init`).
+    /// When present, this takes priority over parsing the compatibility field.
+    pub resolved_packages: Option<Vec<String>>,
+
+    /// Raw `allowed-tools` field value from SKILL.md front matter.
+    /// Example: "Bash(agent-browser:*)"
+    pub allowed_tools: Option<String>,
+
+    /// Whether skill requires elevated permissions (e.g. full filesystem access)
+    pub requires_elevated_permissions: bool,
+
+    /// Capability tags for P2P Discovery routing.
+    ///
+    /// Sourced from SKILL.md front matter `capabilities:` (top-level, preferred) or
+    /// `metadata.capabilities` (array nested under the `metadata:` key, for backward compat).
+    /// Example SKILL.md: `capabilities: ["python", "web", "ml"]`
+    pub capabilities: Vec<String>,
+
+    /// Structured OpenClaw / ClawHub `install[]` declarations, when present.
+    /// `None` means no OpenClaw install block was declared (or it was unusable).
+    /// `node` → npm packages, `uv` → pip packages; `brew` / `go` are recorded but
+    /// not auto-installed (would require host package managers).
+    pub openclaw_installs: Option<super::openclaw_metadata::OpenClawInstalls>,
+}
+
+impl SkillMetadata {
+    /// Returns true if this is a bash-tool skill (has allowed-tools but no script entry point).
+    ///
+    /// Bash-tool skills provide a SKILL.md with `allowed-tools: Bash(...)` and no
+    /// `scripts/` directory. The LLM reads the documentation and issues bash commands.
+    pub fn is_bash_tool_skill(&self) -> bool {
+        self.allowed_tools.is_some() && self.entry_point.is_empty()
+    }
+
+    /// Parse the `allowed-tools` field into structured `BashToolPattern` items.
+    /// Returns an empty vec if `allowed_tools` is None or contains no Bash patterns.
+    pub fn get_bash_patterns(&self) -> Vec<BashToolPattern> {
+        match &self.allowed_tools {
+            Some(raw) => parse_allowed_tools(raw),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns true if this skill depends on Playwright (requires spawn/subprocess, blocked in sandbox).
+    pub fn uses_playwright(&self) -> bool {
+        if let Some(ref packages) = self.resolved_packages {
+            if packages
+                .iter()
+                .any(|p| p.to_lowercase().trim() == "playwright")
+            {
+                return true;
+            }
+        }
+        if let Some(ref compat) = self.compatibility {
+            if compat.to_lowercase().contains("playwright") {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Network access policy (derived from compatibility field)
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicy {
+    /// Whether network access is enabled
+    pub enabled: bool,
+
+    /// List of allowed outbound hosts (e.g., ["*:80", "*:443"])
+    /// When network is enabled via compatibility, defaults to allow all HTTP/HTTPS
+    pub outbound: Vec<String>,
+}
+
+/// Parse compatibility string to extract network policy
+/// Examples:
+///   - "Requires network access" -> enabled=true
+///   - "Requires Python 3.x, internet" -> enabled=true
+///   - "需网络权限" -> enabled=true
+///   - "Requires git, docker" -> enabled=false
+fn parse_compatibility_for_network(compatibility: Option<&str>) -> NetworkPolicy {
+    let Some(compat) = compatibility else {
+        return NetworkPolicy::default();
+    };
+
+    let compat_lower = compat.to_lowercase();
+
+    // Check for network/internet keywords (English and Chinese)
+    let needs_network = compat_lower.contains("network")
+        || compat_lower.contains("internet")
+        || compat_lower.contains("http")
+        || compat_lower.contains("api")
+        || compat_lower.contains("web")
+        // Chinese keywords: 网络(network), 联网(internet), 网页(web page), 在线(online)
+        || compat_lower.contains("网络")
+        || compat_lower.contains("联网")
+        || compat_lower.contains("网页")
+        || compat_lower.contains("在线");
+
+    if needs_network {
+        NetworkPolicy {
+            enabled: true,
+            // Allow all domains by default when network is enabled via compatibility
+            // The "*" wildcard matches all domains in ProxyConfig::domain_matches
+            outbound: vec!["*".to_string()],
+        }
+    } else {
+        NetworkPolicy::default()
+    }
+}
+
+/// Parse compatibility string to detect language
+/// Examples:
+///   - "Requires Python 3.x" -> Some("python")
+///   - "Requires Node.js" -> Some("node")
+///   - "Requires bash" -> Some("bash")
+fn parse_compatibility_for_language(compatibility: Option<&str>) -> Option<String> {
+    let compat = compatibility?;
+    let compat_lower = compat.to_lowercase();
+
+    if compat_lower.contains("python") {
+        Some("python".to_string())
+    } else if compat_lower.contains("node")
+        || compat_lower.contains("javascript")
+        || compat_lower.contains("typescript")
+    {
+        Some("node".to_string())
+    } else if compat_lower.contains("bash") || compat_lower.contains("shell") {
+        Some("bash".to_string())
+    } else {
+        None
+    }
+}
+
+fn is_executable_script_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    if !matches!(ext, "py" | "js" | "ts" | "sh") {
+        return false;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    !(name.starts_with("test_")
+        || name.ends_with("_test.py")
+        || name == "__init__.py"
+        || name.starts_with('.'))
+}
+
+/// Returns true if the skill has at least one executable script under `scripts/`.
+pub fn has_executable_scripts(skill_dir: &Path) -> bool {
+    let scripts_dir = skill_dir.join("scripts");
+    if !scripts_dir.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(scripts_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .any(|p| is_executable_script_file(&p))
+}
+
+/// Auto-detect entry point from skill directory.
+/// Looks for main.{py,js,ts,sh} in scripts/ directory.
+fn detect_entry_point(skill_dir: &Path) -> Option<String> {
+    let scripts_dir = skill_dir.join("scripts");
+    if !scripts_dir.exists() {
+        return None;
+    }
+
+    // Check for main files in priority order
+    for ext in [".py", ".js", ".ts", ".sh"] {
+        let main_file = scripts_dir.join(format!("main{}", ext));
+        if main_file.exists() {
+            return Some(format!("scripts/main{}", ext));
+        }
+    }
+
+    // Check for index files (common in Node.js)
+    for ext in [".py", ".js", ".ts", ".sh"] {
+        let index_file = scripts_dir.join(format!("index{}", ext));
+        if index_file.exists() {
+            return Some(format!("scripts/index{}", ext));
+        }
+    }
+
+    // If only one script file exists, use it
+    let mut script_files = Vec::new();
+    if let Ok(entries) = fs::read_dir(&scripts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_executable_script_file(&path) {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                script_files.push(format!("scripts/{}", name));
+            }
+        }
+    }
+
+    if script_files.len() == 1 {
+        return Some(script_files.remove(0));
+    }
+
+    None
+}
+
+/// Auto-detect language from entry point extension
+fn detect_language_from_entry_point(entry_point: &str) -> Option<String> {
+    if entry_point.ends_with(".py") {
+        Some("python".to_string())
+    } else if entry_point.ends_with(".js") || entry_point.ends_with(".ts") {
+        Some("node".to_string())
+    } else if entry_point.ends_with(".sh") {
+        Some("bash".to_string())
+    } else {
+        None
+    }
+}
+
+/// Parse SKILL.md file and extract metadata from YAML front matter
+pub fn parse_skill_metadata(skill_dir: &Path) -> Result<SkillMetadata> {
+    let skill_md_path = skill_dir.join("SKILL.md");
+
+    if !skill_md_path.exists() {
+        return Err(crate::Error::validation(format!(
+            "SKILL.md not found in directory: {}",
+            skill_dir.display()
+        )));
+    }
+
+    let content = fs::read_to_string(&skill_md_path)
+        .with_context(|| format!("Failed to read SKILL.md: {}", skill_md_path.display()))?;
+
+    extract_yaml_front_matter_with_detection(&content, skill_dir)
+}
+
+/// Infer capability tags from official Agent Skills fields (compatibility, name, description).
+/// Enables P2P routing without requiring custom `capabilities` field.
+/// Keywords are matched case-insensitively.
+fn infer_capabilities_from_compatibility(
+    compatibility: &str,
+    name: &str,
+    description: &str,
+) -> Vec<String> {
+    let mut caps = std::collections::HashSet::new();
+    let s = format!("{} {} {}", compatibility, name, description).to_lowercase();
+
+    // (keyword, capability_tag)
+    let rules: &[(&str, &str)] = &[
+        ("python", "python"),
+        ("network", "web"),
+        ("网络", "web"),
+        ("http", "web"),
+        ("internet", "web"),
+        ("node.js", "node"),
+        ("nodejs", "node"),
+        ("playwright", "browser"),
+        ("agent-browser", "browser"),
+        ("chromium", "browser"),
+        ("browser", "browser"),
+        ("pandas", "data"),
+        ("numpy", "data"),
+        ("data-analysis", "data"),
+        ("calculator", "calc"),
+        ("计算", "calc"),
+        ("arithmetic", "calc"),
+        ("math", "calc"),
+    ];
+
+    for (keyword, tag) in rules {
+        if s.contains(keyword) {
+            caps.insert(tag.to_string());
+        }
+    }
+
+    let mut v: Vec<_> = caps.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// Extract YAML front matter from markdown content (for tests without skill_dir)
+#[cfg(test)]
+fn extract_yaml_front_matter(content: &str) -> Result<SkillMetadata> {
+    extract_yaml_front_matter_impl(content, None)
+}
+
+/// Extract YAML front matter from markdown content with auto-detection
+fn extract_yaml_front_matter_with_detection(
+    content: &str,
+    skill_dir: &Path,
+) -> Result<SkillMetadata> {
+    extract_yaml_front_matter_impl(content, Some(skill_dir))
+}
+
+/// Normalize YAML continuation lines: "   : text" (indent + colon + space + text) is a common
+/// pattern for multiline values. Standard YAML parses ":" as a new key; we merge into previous.
+fn normalize_yaml_continuation_lines(yaml: &str) -> String {
+    YAML_CONTINUATION_RE.replace_all(yaml, " ").to_string()
+}
+
+/// Extract YAML front matter from markdown content
+fn extract_yaml_front_matter_impl(
+    content: &str,
+    skill_dir: Option<&Path>,
+) -> Result<SkillMetadata> {
+    // Match YAML front matter between --- delimiters
+    let captures = YAML_FRONT_MATTER_RE
+        .captures(content)
+        .ok_or_else(|| crate::Error::validation("No YAML front matter found in SKILL.md"))?;
+
+    let yaml_content = captures
+        .get(1)
+        .ok_or_else(|| crate::Error::validation("Failed to extract YAML content"))?
+        .as_str();
+
+    // Normalize continuation lines: "   : text" (indent + colon + space + text) is a common
+    // pattern for multiline values. YAML parses ":" as a new key; we merge into previous line.
+    let yaml_content = normalize_yaml_continuation_lines(yaml_content);
+
+    let front_matter: FrontMatter =
+        serde_yaml::from_str(&yaml_content).with_context(|| "Failed to parse YAML front matter")?;
+
+    // 兼容：front matter 的 entry_point（若有且文件存在）→ 否则目录探测（main.* / index.* / 单脚本）。
+    // 无入口时可由调用方用大模型根据 SKILL.md 推理后通过 entry_point_override 传入 run_skill。
+    let mut entry_point = String::new();
+    if let Some(dir) = skill_dir {
+        if let Some(ref ep) = front_matter.entry_point {
+            let ep = ep.trim();
+            if !ep.is_empty() && dir.join(ep).is_file() {
+                entry_point = ep.to_string();
+            }
+        }
+        if entry_point.is_empty() {
+            if let Some(detected) = detect_entry_point(dir) {
+                entry_point = detected;
+            }
+        }
+    }
+
+    // Merge OpenClaw / ClawHub metadata (openclaw, clawdbot, clawdis aliases) into compatibility.
+    let compatibility = super::openclaw_metadata::merge_into_compatibility(
+        front_matter.compatibility.as_deref(),
+        front_matter.metadata.as_ref(),
+    );
+
+    // Detect language: first from compatibility, then from entry_point
+    let language = parse_compatibility_for_language(compatibility.as_deref())
+        .or_else(|| detect_language_from_entry_point(&entry_point));
+
+    // Parse network policy from compatibility field
+    let network = parse_compatibility_for_network(compatibility.as_deref());
+
+    // Read resolved_packages from .skilllite.lock (written by `skilllite init`)
+    let resolved_packages =
+        skill_dir.and_then(|dir| read_lock_file_packages(dir, compatibility.as_deref()));
+
+    let requires_elevated = front_matter.requires_elevated_permissions.unwrap_or(false);
+
+    // Resolve capabilities: top-level `capabilities:` > metadata.capabilities > infer from compatibility.
+    // compatibility is official Agent Skills field; inferring from it enables routing without custom fields.
+    let capabilities = if !front_matter.capabilities.is_empty() {
+        front_matter.capabilities.clone()
+    } else {
+        front_matter
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("capabilities"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .filter(|v: &Vec<String>| !v.is_empty())
+            .unwrap_or_else(|| {
+                infer_capabilities_from_compatibility(
+                    compatibility.as_deref().unwrap_or(""),
+                    &front_matter.name,
+                    front_matter.description.as_deref().unwrap_or(""),
+                )
+            })
+    };
+
+    let openclaw_installs =
+        super::openclaw_metadata::extract_installs(front_matter.metadata.as_ref());
+
+    let metadata = SkillMetadata {
+        name: front_matter.name.clone(),
+        entry_point,
+        language,
+        description: front_matter.description.clone(),
+        version: front_matter
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("version"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        compatibility,
+        network,
+        resolved_packages,
+        allowed_tools: front_matter.allowed_tools.clone(),
+        requires_elevated_permissions: requires_elevated,
+        capabilities,
+        openclaw_installs,
+    };
+
+    // Validate required fields
+    if metadata.name.is_empty() {
+        return Err(crate::Error::validation(
+            "Skill name is required in SKILL.md",
+        ));
+    }
+
+    Ok(metadata)
+}
+
+/// Read resolved packages from ``.skilllite.lock`` in *skill_dir*.
+///
+/// Returns ``None`` if the lock file is missing, invalid, or stale
+/// (i.e. its ``compatibility_hash`` does not match the current compatibility string).
+fn read_lock_file_packages(skill_dir: &Path, compatibility: Option<&str>) -> Option<Vec<String>> {
+    let lock_path = skill_dir.join(".skilllite.lock");
+    let content = fs::read_to_string(&lock_path).ok()?;
+    let lock: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Staleness check: compare compatibility hash
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(compatibility.unwrap_or("").as_bytes());
+    let current_hash = hex::encode(hasher.finalize());
+
+    if lock.get("compatibility_hash")?.as_str()? != current_hash {
+        return None; // stale lock
+    }
+
+    let arr = lock.get("resolved_packages")?.as_array()?;
+    let packages: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+
+    if packages.is_empty() {
+        None
+    } else {
+        Some(packages)
+    }
+}
+
+/// Detect language from skill directory if not specified
+/// Language is detected from:
+/// 1. metadata.language (from compatibility field)
+/// 2. Entry point file extension
+/// 3. Scripts in scripts/ directory
+pub fn detect_language(skill_dir: &Path, metadata: &SkillMetadata) -> String {
+    // First check metadata (derived from compatibility field)
+    if let Some(ref lang) = metadata.language {
+        return lang.clone();
+    }
+
+    // Detect from entry point extension
+    if metadata.entry_point.ends_with(".py") {
+        return "python".to_string();
+    }
+
+    if metadata.entry_point.ends_with(".js") || metadata.entry_point.ends_with(".ts") {
+        return "node".to_string();
+    }
+
+    if metadata.entry_point.ends_with(".sh") {
+        return "bash".to_string();
+    }
+
+    // Scan scripts directory for language hints
+    let scripts_dir = skill_dir.join("scripts");
+    if scripts_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension() {
+                    match ext.to_string_lossy().as_ref() {
+                        "py" => return "python".to_string(),
+                        "js" | "ts" => return "node".to_string(),
+                        "sh" => return "bash".to_string(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Default to python
+    "python".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_infer_capabilities_from_compatibility() {
+        // From compatibility
+        let caps = infer_capabilities_from_compatibility(
+            "Requires Python 3.x, network access",
+            "test",
+            "",
+        );
+        assert!(caps.contains(&"python".to_string()));
+        assert!(caps.contains(&"web".to_string()));
+
+        // From name (calculator)
+        let caps = infer_capabilities_from_compatibility("", "calculator", "");
+        assert_eq!(caps, vec!["calc"]);
+
+        // From description (arithmetic)
+        let caps = infer_capabilities_from_compatibility("", "foo", "basic arithmetic operations");
+        assert_eq!(caps, vec!["calc"]);
+    }
+
+    #[test]
+    fn test_parse_yaml_continuation_lines() {
+        // "   : text" continuation format (common in SKILL.md, invalid in strict YAML)
+        let content = r#"---
+name: agent-browser
+description: Browser automation CLI for AI agents.
+   : Requires Node.js with agent-browser Use when the user needs to interact with websites.
+allowed-tools: Bash(agent-browser:*)
+---
+"#;
+        let metadata =
+            extract_yaml_front_matter(content).expect("continuation lines should be normalized");
+        assert_eq!(metadata.name, "agent-browser");
+        assert!(metadata
+            .description
+            .as_ref()
+            .expect("test skill has description")
+            .contains("Browser automation CLI"));
+        assert!(metadata
+            .description
+            .as_ref()
+            .expect("test skill has description")
+            .contains("Requires Node.js"));
+    }
+
+    #[test]
+    fn test_parse_yaml_front_matter_with_compatibility() {
+        let content = r#"---
+name: test-skill
+description: A test skill for testing
+compatibility: Requires Python 3.x with requests library, network access
+---
+
+# Test Skill
+
+This is a test skill.
+"#;
+
+        let metadata =
+            extract_yaml_front_matter(content).expect("test YAML parsing should succeed");
+        assert_eq!(metadata.name, "test-skill");
+        assert_eq!(metadata.language, Some("python".to_string()));
+        assert!(metadata.network.enabled);
+        // When network is enabled via compatibility, allow all domains with "*" wildcard
+        assert_eq!(metadata.network.outbound, vec!["*"]);
+        // Capabilities inferred from compatibility (no explicit capabilities)
+        assert!(metadata.capabilities.contains(&"python".to_string()));
+        assert!(metadata.capabilities.contains(&"web".to_string()));
+    }
+
+    #[test]
+    fn test_parse_compatibility_for_network() {
+        // Network enabled cases (English)
+        assert!(parse_compatibility_for_network(Some("Requires network access")).enabled);
+        assert!(parse_compatibility_for_network(Some("Requires internet")).enabled);
+        assert!(parse_compatibility_for_network(Some("Requires http client")).enabled);
+        assert!(parse_compatibility_for_network(Some("Requires API access")).enabled);
+        assert!(parse_compatibility_for_network(Some("Requires web access")).enabled);
+
+        // Network enabled cases (Chinese)
+        assert!(parse_compatibility_for_network(Some("需网络权限")).enabled);
+        assert!(parse_compatibility_for_network(Some("Python 3.x，需网络权限")).enabled);
+        assert!(parse_compatibility_for_network(Some("需要联网")).enabled);
+        assert!(parse_compatibility_for_network(Some("需要网页访问")).enabled);
+        assert!(parse_compatibility_for_network(Some("在线服务")).enabled);
+
+        // Network disabled cases
+        assert!(!parse_compatibility_for_network(Some("Requires git, docker")).enabled);
+        assert!(!parse_compatibility_for_network(Some("Requires Python 3.x")).enabled);
+        assert!(!parse_compatibility_for_network(None).enabled);
+    }
+
+    #[test]
+    fn test_parse_compatibility_for_language() {
+        assert_eq!(
+            parse_compatibility_for_language(Some("Requires Python 3.x")),
+            Some("python".to_string())
+        );
+        assert_eq!(
+            parse_compatibility_for_language(Some("Requires Node.js")),
+            Some("node".to_string())
+        );
+        assert_eq!(
+            parse_compatibility_for_language(Some("Requires JavaScript")),
+            Some("node".to_string())
+        );
+        assert_eq!(
+            parse_compatibility_for_language(Some("Requires bash")),
+            Some("bash".to_string())
+        );
+        assert_eq!(
+            parse_compatibility_for_language(Some("Requires git, docker")),
+            None
+        );
+        assert_eq!(parse_compatibility_for_language(None), None);
+    }
+
+    #[test]
+    fn test_default_network_policy() {
+        let content = r#"---
+name: simple-skill
+description: A simple skill
+---
+"#;
+
+        let metadata =
+            extract_yaml_front_matter(content).expect("test YAML parsing should succeed");
+        assert!(!metadata.network.enabled);
+        assert!(metadata.network.outbound.is_empty());
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_single() {
+        let patterns = parse_allowed_tools("Bash(agent-browser:*)");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].command_prefix, "agent-browser");
+        assert_eq!(patterns[0].raw_pattern, "agent-browser:*");
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_multiple() {
+        let patterns = parse_allowed_tools("Bash(agent-browser:*), Bash(npm:*)");
+        assert_eq!(patterns.len(), 2);
+        assert_eq!(patterns[0].command_prefix, "agent-browser");
+        assert_eq!(patterns[1].command_prefix, "npm");
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_mixed() {
+        // Non-Bash tools should be ignored
+        let patterns = parse_allowed_tools("Read, Edit, Bash(mycli:*)");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].command_prefix, "mycli");
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_no_colon() {
+        let patterns = parse_allowed_tools("Bash(simple-tool)");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].command_prefix, "simple-tool");
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_space_wildcard() {
+        let patterns = parse_allowed_tools("Bash(infsh *)");
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].command_prefix, "infsh");
+        assert_eq!(patterns[0].raw_pattern, "infsh *");
+    }
+
+    #[test]
+    fn test_parse_allowed_tools_empty() {
+        let patterns = parse_allowed_tools("Read, Edit");
+        assert!(patterns.is_empty());
+    }
+
+    #[test]
+    fn test_bash_tool_skill_yaml() {
+        let content = r#"---
+name: agent-browser
+description: Headless browser automation for AI agents
+allowed-tools: Bash(agent-browser:*)
+---
+
+# Agent Browser
+
+Use agent-browser CLI to automate web browsing.
+"#;
+
+        let metadata =
+            extract_yaml_front_matter(content).expect("bash tool skill YAML should parse");
+        assert_eq!(metadata.name, "agent-browser");
+        assert!(metadata.entry_point.is_empty());
+        assert_eq!(
+            metadata.allowed_tools,
+            Some("Bash(agent-browser:*)".to_string())
+        );
+        assert!(metadata.is_bash_tool_skill());
+
+        let patterns = metadata.get_bash_patterns();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].command_prefix, "agent-browser");
+    }
+
+    #[test]
+    fn test_not_bash_tool_skill_with_entry_point() {
+        let content = r#"---
+name: regular-skill
+description: A regular skill with scripts
+compatibility: Requires Python 3.x
+---
+"#;
+        // This skill has no allowed-tools, so it's not a bash tool skill
+        let metadata = extract_yaml_front_matter(content).expect("regular skill YAML should parse");
+        assert!(!metadata.is_bash_tool_skill());
+    }
+
+    #[test]
+    fn test_openclaw_metadata_merge() {
+        let content = r#"---
+name: nano-banana-pro
+description: Generate or edit images via Gemini 3 Pro Image
+metadata:
+  openclaw:
+    requires:
+      bins: [uv]
+      env: [GEMINI_API_KEY]
+      config: [browser.enabled]
+    primaryEnv: GEMINI_API_KEY
+---
+"#;
+        let metadata =
+            extract_yaml_front_matter(content).expect("OpenClaw format YAML should parse");
+        assert_eq!(metadata.name, "nano-banana-pro");
+        assert_eq!(
+            metadata.compatibility.as_deref(),
+            Some(
+                "Requires bins: uv. Requires env: GEMINI_API_KEY. Requires config: browser.enabled. Primary credential env: GEMINI_API_KEY"
+            )
+        );
+    }
+
+    #[test]
+    fn test_openclaw_metadata_merge_with_base_compatibility() {
+        let content = r#"---
+name: test-skill
+description: Test
+compatibility: Requires Python 3.x
+metadata:
+  openclaw:
+    requires:
+      bins: [uv]
+      env: [API_KEY]
+---
+"#;
+        let metadata = extract_yaml_front_matter(content)
+            .expect("OpenClaw format with base compat should parse");
+        assert_eq!(
+            metadata.compatibility.as_deref(),
+            Some("Requires Python 3.x. Requires bins: uv. Requires env: API_KEY")
+        );
+        assert_eq!(metadata.language, Some("python".to_string()));
+    }
+
+    #[test]
+    fn test_entry_point_from_front_matter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path();
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts");
+        std::fs::write(skill_dir.join("scripts/entry.py"), "").expect("write entry.py");
+        let content = r#"---
+name: my-skill
+entry_point: scripts/entry.py
+---
+
+# Doc
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), content).expect("write SKILL.md");
+        let meta = parse_skill_metadata(skill_dir).expect("parse skill metadata");
+        assert_eq!(meta.entry_point, "scripts/entry.py");
+    }
+
+    #[test]
+    fn test_entry_point_no_explicit_uses_directory_convention() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path();
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts");
+        std::fs::write(skill_dir.join("scripts/main.py"), "").expect("write main.py");
+        let content = r#"---
+name: my-skill
+---
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), content).expect("write SKILL.md");
+        let meta = parse_skill_metadata(skill_dir).expect("parse skill metadata");
+        assert_eq!(meta.entry_point, "scripts/main.py");
+    }
+
+    #[test]
+    fn test_has_executable_scripts_true_for_supported_script() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path();
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts");
+        std::fs::write(skill_dir.join("scripts/task.js"), "console.log('ok');")
+            .expect("write task.js");
+        assert!(has_executable_scripts(skill_dir));
+    }
+
+    #[test]
+    fn test_has_executable_scripts_false_for_test_only_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skill_dir = dir.path();
+        std::fs::create_dir_all(skill_dir.join("scripts")).expect("create scripts");
+        std::fs::write(skill_dir.join("scripts/test_helper.py"), "print('x')")
+            .expect("write test_helper.py");
+        std::fs::write(skill_dir.join("scripts/__init__.py"), "").expect("write __init__.py");
+        assert!(!has_executable_scripts(skill_dir));
+    }
+}

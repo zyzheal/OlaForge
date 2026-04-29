@@ -1,0 +1,19 @@
+[package]
+name = "olaforge-fs"
+version = "1.0.0"
+edition = "2021"
+authors = ["OlaForge Team"]
+license = "MIT"
+repository = "https://github.com/zyzheal/OlaForge"
+homepage = "https://github.com/zyzheal/OlaForge"
+description = "Safe file operations for AI agents — read, write, search & replace with path validation"
+keywords = ["filesystem", "file-operations", "search-replace", "agent", "tools"]
+categories = ["filesystem", "development-tools"]
+
+[dependencies]
+anyhow = "1.0"
+regex = "1.10"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

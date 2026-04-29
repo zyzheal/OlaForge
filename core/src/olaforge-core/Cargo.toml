@@ -1,0 +1,39 @@
+[package]
+name = "olaforge-core"
+version = "1.0.0"
+edition = "2021"
+authors = ["OlaForge Team"]
+license = "MIT"
+repository = "https://github.com/zyzheal/OlaForge"
+homepage = "https://github.com/zyzheal/OlaForge"
+description = "OlaForge Core: config, skill metadata, path validation, observability"
+keywords = ["ai", "config", "sandbox", "skills", "agent"]
+categories = ["development-tools", "config"]
+
+[dependencies]
+olaforge-fs = { path = "../olaforge-fs",  }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+regex = "1.10"
+dirs = "5.0"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Optional: async support for LLM-based dependency resolution
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[features]
+default = []
+async-resolve = ["dep:reqwest", "dep:tokio", "dep:async-trait"]
+
+[dev-dependencies]
+tempfile = "3.10"

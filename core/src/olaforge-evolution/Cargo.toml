@@ -1,0 +1,34 @@
+[package]
+name = "olaforge-evolution"
+version = "1.0.0"
+edition = "2021"
+authors = ["OlaForge Team"]
+license = "MIT"
+repository = "https://github.com/zyzheal/OlaForge"
+homepage = "https://github.com/zyzheal/OlaForge"
+description = "Self-evolving AI agent engine — auto-improves prompts, skills, and memory from usage patterns"
+keywords = ["ai", "self-evolving", "agent", "memory", "llm"]
+categories = ["development-tools", "algorithms"]
+
+[dependencies]
+olaforge-core = { path = "../olaforge-core",  }
+olaforge-fs = { path = "../olaforge-fs",  }
+olaforge-sandbox = { path = "../olaforge-sandbox",  }
+
+async-trait = "0.1"
+anyhow = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+dirs = "5.0"
+tempfile = "3.10"
+uuid = { version = "1", features = ["v4"] }
+regex = "1.10"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.10"

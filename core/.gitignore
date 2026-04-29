@@ -1,0 +1,6 @@
+/target
+/debug
+*.lock
+.DS_Store
+*.swp
+*.swo

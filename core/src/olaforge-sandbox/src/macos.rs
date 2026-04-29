@@ -1,0 +1,785 @@
+use crate::common::{
+    self, apply_standard_execution_env, get_script_args_from_env, pipe_stdio, resolve_which,
+    spawn_write_and_wait, start_network_proxy,
+};
+use crate::error::bail;
+use crate::move_protection::{generate_log_tag, generate_move_blocking_rules, get_session_suffix};
+use crate::runner::{ExecutionResult, RuntimePaths, SandboxConfig};
+use crate::runtime_resolver::RuntimeResolver;
+use crate::seatbelt::generate_seatbelt_mandatory_deny_patterns;
+use crate::security::policy::{self as security_policy, ResolvedNetworkPolicy};
+use crate::Result;
+use std::fs;
+use std::net::ToSocketAddrs;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+/// Execute a skill in a macOS sandbox with custom resource limits
+pub fn execute_with_limits(
+    skill_dir: &Path,
+    runtime: &RuntimePaths,
+    config: &SandboxConfig,
+    input_json: &str,
+    limits: crate::runner::ResourceLimits,
+) -> Result<ExecutionResult> {
+    if olaforge_core::config::SandboxEnvConfig::from_env().no_sandbox {
+        tracing::warn!("Sandbox disabled via SKILLLITE_NO_SANDBOX - running without protection");
+        crate::info_log!("[INFO] using simple execution (no sandbox-exec)");
+        return execute_simple_with_limits(skill_dir, runtime, config, input_json, limits);
+    }
+
+    if security_policy::should_allow_playwright() && config.uses_playwright {
+        crate::info_log!(
+            "[INFO] Skill {} uses Playwright; skipping sandbox (SKILLLITE_ALLOW_PLAYWRIGHT/L2)",
+            config.name
+        );
+        return execute_simple_with_limits(skill_dir, runtime, config, input_json, limits);
+    }
+
+    crate::info_log!("[INFO] using sandbox-exec (Seatbelt)...");
+    match execute_with_sandbox(skill_dir, runtime, config, input_json, limits) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            olaforge_core::observability::security_sandbox_fallback(
+                &config.name,
+                "seatbelt_exec_failed",
+            );
+            Err(crate::Error::Other(anyhow::Error::from(e).context(
+                "Sandbox execution failed. Refusing to fall back to unsandboxed execution. \
+                 Set SKILLLITE_NO_SANDBOX=1 to explicitly run without sandbox (not recommended).",
+            )))
+        }
+    }
+}
+
+/// Simple execution without sandbox (fallback for when sandbox-exec is unavailable).
+///
+/// Delegates to the shared Unix implementation in `common::execute_unsandboxed`.
+pub fn execute_simple_with_limits(
+    skill_dir: &Path,
+    runtime: &RuntimePaths,
+    config: &SandboxConfig,
+    input_json: &str,
+    limits: crate::runner::ResourceLimits,
+) -> Result<ExecutionResult> {
+    crate::info_log!("[INFO] simple: executing {}...", config.entry_point);
+    common::execute_unsandboxed(skill_dir, runtime, config, input_json, limits)
+}
+
+/// Execute with macOS sandbox-exec with resource limits and network proxy (pure Rust, no script injection)
+fn execute_with_sandbox(
+    skill_dir: &Path,
+    runtime: &RuntimePaths,
+    config: &SandboxConfig,
+    input_json: &str,
+    limits: crate::runner::ResourceLimits,
+) -> Result<ExecutionResult> {
+    let temp_dir = TempDir::new()?;
+    let work_dir = temp_dir.path();
+
+    let network_policy =
+        security_policy::resolve_network_policy(config.network_enabled, &config.network_outbound);
+
+    let proxy_manager = start_network_proxy(&network_policy);
+
+    let resolved = runtime.resolve(&config.language).ok_or_else(|| {
+        crate::Error::validation(format!("Unsupported language: {}", config.language))
+    })?;
+
+    // Generate sandbox profile with proxy ports if available
+    let profile_path = work_dir.join("sandbox.sb");
+    let profile_content = generate_sandbox_profile_with_proxy(
+        skill_dir,
+        &runtime.env_dir,
+        config,
+        work_dir,
+        proxy_manager.as_ref().and_then(|m| m.http_port()),
+        proxy_manager.as_ref().and_then(|m| m.socks5_port()),
+        &network_policy,
+        &resolved.interpreter,
+    )?;
+    fs::write(&profile_path, &profile_content)?;
+
+    let mut args = vec![config.entry_point.to_string()];
+    args.extend(get_script_args_from_env());
+
+    let mut cmd = Command::new("sandbox-exec");
+    cmd.arg("-f").arg(&profile_path);
+    cmd.arg(&resolved.interpreter);
+    cmd.args(&args);
+
+    cmd.current_dir(skill_dir);
+    pipe_stdio(&mut cmd);
+
+    apply_standard_execution_env(&mut cmd, true, work_dir, config.network_enabled, true);
+
+    for (k, v) in &resolved.extra_env {
+        cmd.env(k, v);
+    }
+    if let Some(ref manager) = proxy_manager {
+        for (key, value) in manager.get_proxy_env_vars() {
+            cmd.env(&key, &value);
+        }
+    }
+
+    unsafe { common::set_rlimits_pre_exec(&mut cmd, &limits) };
+
+    crate::info_log!("[INFO] sandbox-exec: spawning...");
+    let (result, was_killed, kill_reason) = spawn_write_and_wait(
+        &mut cmd,
+        input_json,
+        &limits,
+        true,
+        "Failed to spawn sandbox-exec",
+    )?;
+
+    if result.exit_code == 1 && result.stderr.is_empty() && result.stdout.is_empty() && !was_killed
+    {
+        bail!("sandbox-exec failed to execute");
+    }
+    if was_killed {
+        if let Some(reason) = &kill_reason {
+            tracing::error!("Process terminated due to: {}", reason);
+        }
+    }
+
+    drop(proxy_manager);
+    Ok(result)
+}
+
+/// Generate a Seatbelt sandbox profile for macOS with network proxy support
+///
+/// Security controls from canonical security_policy:
+/// 1. MANDATORY DENY: Always block writes to shell configs, git hooks, IDE configs, etc.
+/// 2. MOVE PROTECTION: Block file movement to prevent bypass via mv/rename (P0)
+/// 3. NETWORK: Route through proxy when enabled, block all when disabled
+/// 4. FILE READ: Block sensitive files (/etc, ~/.ssh, etc.)
+/// 5. FILE WRITE: Block writes outside work directory (deny-default + whitelist)
+/// 6. PROCESS EXEC: Whitelist-only — only the resolved interpreter is allowed
+/// 7. PROCESS FORK: Denied by default (allowed only for Playwright)
+/// 8. IPC/KERNEL: Block mach-register, mach-priv-task-port, iokit-open
+/// 9. LOGTAG: Embed unique tag in deny rules for precise violation tracking (P1)
+#[allow(clippy::too_many_arguments)]
+fn generate_sandbox_profile_with_proxy(
+    skill_dir: &Path,
+    env_path: &Path,
+    config: &SandboxConfig,
+    work_dir: &Path,
+    http_proxy_port: Option<u16>,
+    socks5_proxy_port: Option<u16>,
+    network_policy: &ResolvedNetworkPolicy,
+    interpreter_path: &Path,
+) -> Result<String> {
+    let skill_dir_str = skill_dir.to_string_lossy();
+    let work_dir_str = work_dir.to_string_lossy();
+
+    let relaxed = security_policy::is_relaxed_mode();
+    let allow_playwright = security_policy::should_allow_playwright();
+
+    // Generate unique log tag for this execution (P1: precise violation tracking)
+    let command_desc = format!("skill:{}", config.name);
+    let log_tag = generate_log_tag(&command_desc);
+
+    let mut profile = String::new();
+
+    // Version declaration with log tag for violation tracking
+    profile.push_str("(version 1)\n\n");
+    profile.push_str(&format!("; LogTag: {}\n", log_tag));
+    profile.push_str(&format!("; SessionSuffix: {}\n\n", get_session_suffix()));
+
+    // ============================================================
+    // SECURITY: Mandatory deny paths - ALWAYS blocked, even in allowed dirs
+    // These protect against sandbox escapes and configuration tampering
+    // ============================================================
+    profile.push_str("; SECURITY: Mandatory deny paths (auto-protected files)\n");
+    profile.push_str("; These are ALWAYS blocked from writes, even within allowed paths\n");
+    profile
+        .push_str("; Includes: shell configs, git hooks, IDE settings, package manager configs,\n");
+    profile.push_str(";           security files (.ssh, .aws, etc.), and AI agent configs\n");
+    for pattern in generate_seatbelt_mandatory_deny_patterns() {
+        // Add log tag to each deny pattern for tracking
+        let pattern_with_tag = if pattern.ends_with(')') {
+            // Insert (with message "log_tag") before the closing paren
+            let without_close = &pattern[..pattern.len() - 1];
+            format!("{}\n  (with message \"{}\"))", without_close, log_tag)
+        } else {
+            pattern
+        };
+        profile.push_str(&pattern_with_tag);
+        profile.push('\n');
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Move blocking rules - Prevent bypass via mv/rename (P0)
+    // Paths from canonical security_policy::get_move_protection_paths()
+    // ============================================================
+    profile.push_str("; SECURITY: Move blocking rules (prevents bypass via mv/rename)\n");
+    profile.push_str("; Blocks moving/renaming protected paths and their ancestor directories\n");
+    for rule in
+        generate_move_blocking_rules(&security_policy::get_move_protection_paths(), &log_tag)
+    {
+        profile.push_str(&rule);
+        profile.push('\n');
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Block sensitive file reads (from security_policy)
+    // ============================================================
+    profile.push_str("; SECURITY: Block reading sensitive files\n");
+    for rule in crate::seatbelt::generate_seatbelt_sensitive_read_deny_rules(relaxed) {
+        profile.push_str(&rule);
+        profile.push('\n');
+    }
+    profile.push('\n');
+    // ============================================================
+    // SECURITY: Network isolation with proxy support (from security_policy)
+    // ============================================================
+    if security_policy::is_network_blocked(network_policy) {
+        profile.push_str("; SECURITY: Network access DISABLED\n");
+        profile.push_str("(deny network*)\n\n");
+    } else if security_policy::is_allow_all_network(network_policy) {
+        // Network enabled with wildcard "*" - allow all network access without proxy
+        profile.push_str("; SECURITY: Network access ALLOWED (wildcard '*' configured)\n");
+        profile.push_str("; All outbound network traffic is permitted\n");
+        profile.push_str("(allow network*)\n\n");
+    } else if http_proxy_port.is_some() || socks5_proxy_port.is_some() {
+        // Network enabled with proxy - allow connections to localhost for proxy
+        // macOS Seatbelt requires: (remote tcp "localhost:PORT") format
+        profile.push_str("; SECURITY: Network access via PROXY\n");
+        profile.push_str("; All outbound traffic should go through the filtering proxy\n");
+        profile.push_str(&format!(
+            "; HTTP proxy port: {:?}, SOCKS5 proxy port: {:?}\n",
+            http_proxy_port, socks5_proxy_port
+        ));
+
+        // Allow connections to specific proxy ports on localhost
+        if let Some(http_port) = http_proxy_port {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
+                http_port
+            ));
+        }
+        if let Some(socks_port) = socks5_proxy_port {
+            profile.push_str(&format!(
+                "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
+                socks_port
+            ));
+        }
+        profile.push('\n');
+    } else {
+        // Network enabled but no proxy configured
+        // Block all network access by default for security
+        profile.push_str("; SECURITY: Network access BLOCKED (deny-default mode)\n");
+        profile.push_str("; Note: All network operations are blocked for security\n");
+        profile.push_str("(deny network*)\n\n");
+    }
+
+    // ============================================================
+    // SECURITY: Process control — fork + execution whitelist
+    // ============================================================
+
+    // --- Process fork control ---
+    if allow_playwright {
+        profile.push_str("; Playwright mode: allow process-fork for subprocess.Popen / Chromium\n");
+        profile.push_str("(allow process-fork)\n");
+    } else {
+        profile.push_str("; SECURITY: Block process forking (prevents subprocess execution)\n");
+        profile.push_str("(deny process-fork)\n");
+    }
+
+    // --- Process execution whitelist (replaces blacklist approach) ---
+    profile.push_str(
+        "; SECURITY: Process execution whitelist — only the resolved interpreter is allowed\n",
+    );
+
+    // Resolve bare interpreter names ("python3", "node") to absolute paths.
+    // Bare names won't match in Seatbelt (literal) because the kernel uses full paths.
+    let interpreter_abs = if interpreter_path.is_absolute() {
+        interpreter_path.to_path_buf()
+    } else {
+        resolve_which(interpreter_path).unwrap_or_else(|| interpreter_path.to_path_buf())
+    };
+    let interpreter_str = interpreter_abs.to_string_lossy();
+    profile.push_str(&format!(
+        "(allow process-exec (literal \"{}\"))\n",
+        interpreter_str
+    ));
+
+    // Also allow the canonical path (handles venv symlinks → real binary)
+    if let Ok(canonical) = interpreter_abs.canonicalize() {
+        let canonical_str = canonical.to_string_lossy();
+        if canonical_str.as_ref() != interpreter_str.as_ref() {
+            profile.push_str(&format!(
+                "(allow process-exec (literal \"{}\"))\n",
+                canonical_str
+            ));
+        }
+        // macOS framework Python (Homebrew / python.org) uses posix_spawn to re-exec
+        // through Python.app bundle. Allow the entire framework version directory so
+        // both .../bin/python3 and .../Resources/Python.app/Contents/MacOS/Python work.
+        if let Some(fw_version_root) = extract_python_framework_version_root(&canonical_str) {
+            profile.push_str(&format!(
+                "(allow process-exec (subpath \"{}\"))\n",
+                fw_version_root
+            ));
+        }
+    }
+
+    // Playwright: also allow driver (Node.js in venv) and Chromium
+    if allow_playwright {
+        if !env_path.as_os_str().is_empty() && env_path.exists() {
+            let env_path_str = env_path.to_string_lossy();
+            profile.push_str(&format!(
+                "(allow process-exec (subpath \"{}\"))\n",
+                env_path_str
+            ));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let playwright_cache = format!("{}/Library/Caches/ms-playwright", home);
+            if Path::new(&playwright_cache).exists() {
+                profile.push_str(&format!(
+                    "(allow process-exec (subpath \"{}\"))\n",
+                    playwright_cache
+                ));
+            }
+        }
+    }
+
+    // Deny all other process execution (whitelist-only)
+    profile.push_str("(deny process-exec)\n");
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: File write restrictions (deny-default mode)
+    // Block ALL file writes by default, then allow specific paths only
+    // ============================================================
+    profile.push_str("; SECURITY: File write restrictions (deny-default mode)\n");
+    profile.push_str("; Block ALL file writes by default\n");
+    profile.push_str("(deny file-write*)\n");
+    profile.push('\n');
+
+    // Allow writing to isolated work directory (TMPDIR points here)
+    profile.push_str("; Allow writing to isolated work directory\n");
+    profile.push_str(&format!(
+        "(allow file-write* (subpath \"{}\"))\n",
+        work_dir_str
+    ));
+
+    // Allow writing to project root (parent of .skills) for skill outputs (e.g. xiaohongshu_thumbnail.png)
+    if let Some(project_root) = skill_dir.parent().and_then(|p| p.parent()) {
+        let project_root_str = project_root.to_string_lossy();
+        if !project_root_str.is_empty() && project_root != skill_dir {
+            profile.push_str("; Allow writing to project root for skill outputs\n");
+            profile.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                project_root_str
+            ));
+        }
+    }
+
+    // Allow writing to /var/folders for system temp files (Python, Node.js cache)
+    profile.push_str("; Allow writing to /var/folders for system temp files\n");
+    profile.push_str("(allow file-write* (subpath \"/var/folders\"))\n");
+    profile.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
+    // L2 relaxed: allow ~/Library/Caches for Playwright, pip cache
+    if relaxed {
+        profile.push_str("(allow file-write* (regex #\"^/Users/[^/]+/Library/Caches\"))\n");
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Block high-risk IPC and kernel operations
+    // These are never needed by skill scripts and can be used for sandbox escape
+    // ============================================================
+    profile.push_str("; SECURITY: Block high-risk IPC and kernel operations\n");
+    profile.push_str("(deny mach-register)\n"); // prevent Mach service injection
+    profile.push_str("(deny mach-priv-task-port)\n"); // prevent debugging/injecting other processes
+    profile.push_str("(deny iokit-open)\n"); // prevent direct kernel driver access
+    profile.push('\n');
+
+    // ============================================================
+    // ALLOW DEFAULT - For remaining operations (mach-lookup, sysctl, signal, etc.)
+    // Explicitly denied operations above are NOT overridden by allow-default.
+    // ============================================================
+    profile.push_str(
+        "; Allow default for runtime compatibility (mach-lookup, sysctl, signal, etc.)\n",
+    );
+    profile.push_str("(allow default)\n\n");
+
+    // ============================================================
+    // ALLOW: Skill and runtime environment directories
+    // skill_dir: skill scripts
+    // env_path: skilllite isolated env (Python venv / Node node_modules)
+    // work_dir: TMPDIR, Python needs read/write for temp files
+    // ============================================================
+    profile.push_str("; Allow reading skill directory\n");
+    profile.push_str(&format!(
+        "(allow file-read* (subpath \"{}\"))\n",
+        skill_dir_str
+    ));
+    profile.push_str("; Allow reading TMPDIR (Python temp files)\n");
+    profile.push_str(&format!(
+        "(allow file-read* (subpath \"{}\"))\n",
+        work_dir_str
+    ));
+
+    // env_path: Python venv or Node node_modules cache, must be readable
+    if !env_path.as_os_str().is_empty() && env_path.exists() {
+        let env_path_str = env_path.to_string_lossy();
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            env_path_str
+        ));
+    }
+    // L2 relaxed: runtime env dirs (Python/Node/Playwright etc.)
+    // macOS: ~/Library/Caches (skilllite/envs, pip, playwright, npm)
+    // Covers env_path parent and sibling runtime caches
+    if relaxed {
+        profile.push_str("; L2: runtime env dirs (venv, node_modules, pip, playwright, npm)\n");
+        profile.push_str("(allow file-read* (regex #\"^/Users/[^/]+/Library/Caches\"))\n");
+        // System runtime (when env_path empty, use system python/node)
+        profile.push_str("(allow file-read* (subpath \"/usr\"))\n");
+        profile.push_str("(allow file-read* (subpath \"/opt/homebrew\"))\n");
+        profile.push_str("(allow file-read* (subpath \"/opt/local\"))\n");
+    }
+    // Python/Pillow runtime paths (xiaohongshu-writer etc. need read in L2)
+    // - /System/Library: dyld, Frameworks, Fonts
+    profile.push_str("(allow file-read* (subpath \"/System/Library\"))\n");
+    // - /Library: Frameworks, Fonts (python.org install etc.)
+    profile.push_str("(allow file-read* (subpath \"/Library\"))\n");
+    // - /dev: /dev/null, /dev/urandom (Python basic I/O)
+    profile.push_str("(allow file-read* (subpath \"/dev\"))\n");
+    // - Timezone: override /etc deny, allow localtime only
+    profile.push_str("(allow file-read* (literal \"/private/etc/localtime\"))\n");
+    profile.push('\n');
+
+    Ok(profile)
+}
+
+/// Generate a Seatbelt sandbox profile for macOS (legacy, without proxy)
+///
+/// Security controls:
+/// 1. MANDATORY DENY: Always block writes to shell configs, git hooks, IDE configs, etc.
+/// 2. NETWORK: Block all network access when disabled
+/// 3. FILE READ: Block sensitive files (/etc, ~/.ssh, etc.)
+/// 4. FILE WRITE: Block writes outside work directory (deny-default + whitelist)
+/// 5. PROCESS EXEC: Whitelist-only — only the resolved interpreter is allowed
+/// 6. PROCESS FORK: Denied by default
+/// 7. IPC/KERNEL: Block mach-register, mach-priv-task-port, iokit-open
+#[allow(dead_code)] // called only from #[cfg(test)]
+fn generate_sandbox_profile(
+    skill_dir: &Path,
+    env_path: &Path,
+    config: &SandboxConfig,
+    work_dir: &Path,
+    interpreter_path: &Path,
+) -> Result<String> {
+    let skill_dir_str = skill_dir.to_string_lossy();
+    let work_dir_str = work_dir.to_string_lossy();
+
+    let mut profile = String::new();
+
+    // Version declaration
+    profile.push_str("(version 1)\n\n");
+
+    // ============================================================
+    // SECURITY: Mandatory deny paths - ALWAYS blocked, even in allowed dirs
+    // These protect against sandbox escapes and configuration tampering
+    // ============================================================
+    profile.push_str("; SECURITY: Mandatory deny paths (auto-protected files)\n");
+    profile.push_str("; These are ALWAYS blocked from writes, even within allowed paths\n");
+    profile
+        .push_str("; Includes: shell configs, git hooks, IDE settings, package manager configs,\n");
+    profile.push_str(";           security files (.ssh, .aws, etc.), and AI agent configs\n");
+    for pattern in generate_seatbelt_mandatory_deny_patterns() {
+        profile.push_str(&pattern);
+        profile.push('\n');
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Block sensitive file reads BEFORE allow default
+    // ============================================================
+    profile.push_str("; SECURITY: Block reading sensitive files\n");
+    profile.push_str("(deny file-read* (subpath \"/etc\"))\n");
+    profile.push_str("(deny file-read* (subpath \"/private/etc\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.ssh\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.aws\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.gnupg\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.kube\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.docker\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.config\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.netrc\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.npmrc\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.pypirc\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.bash_history\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/\\.zsh_history\"))\n");
+    profile.push_str("(deny file-read* (regex #\"^/Users/[^/]+/Library/Keychains\"))\n");
+    let relaxed = olaforge_core::config::SandboxEnvConfig::from_env().sandbox_level == 2;
+    if !relaxed {
+        profile.push_str("(deny file-read* (regex #\"/\\.git/\"))\n");
+        profile.push_str("(deny file-read* (regex #\"/\\.env$\"))\n");
+        profile.push_str("(deny file-read* (regex #\"/\\.env\\.[^/]+$\"))\n");
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Network isolation
+    // ============================================================
+    if !config.network_enabled {
+        profile.push_str("; SECURITY: Network access DISABLED\n");
+        profile.push_str("(deny network*)\n\n");
+    }
+
+    // ============================================================
+    // SECURITY: Process control — fork + execution whitelist
+    // ============================================================
+    profile.push_str("; SECURITY: Block process forking\n");
+    profile.push_str("(deny process-fork)\n");
+
+    profile.push_str(
+        "; SECURITY: Process execution whitelist — only the resolved interpreter is allowed\n",
+    );
+    let interpreter_abs = if interpreter_path.is_absolute() {
+        interpreter_path.to_path_buf()
+    } else {
+        resolve_which(interpreter_path).unwrap_or_else(|| interpreter_path.to_path_buf())
+    };
+    let interpreter_str = interpreter_abs.to_string_lossy();
+    profile.push_str(&format!(
+        "(allow process-exec (literal \"{}\"))\n",
+        interpreter_str
+    ));
+    if let Ok(canonical) = interpreter_abs.canonicalize() {
+        let canonical_str = canonical.to_string_lossy();
+        if canonical_str.as_ref() != interpreter_str.as_ref() {
+            profile.push_str(&format!(
+                "(allow process-exec (literal \"{}\"))\n",
+                canonical_str
+            ));
+        }
+        // macOS framework Python: allow posix_spawn re-exec through Python.app bundle
+        if let Some(fw_version_root) = extract_python_framework_version_root(&canonical_str) {
+            profile.push_str(&format!(
+                "(allow process-exec (subpath \"{}\"))\n",
+                fw_version_root
+            ));
+        }
+    }
+    profile.push_str("(deny process-exec)\n");
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: File write restrictions (deny-default mode)
+    // Block ALL file writes by default, then allow specific paths only
+    // ============================================================
+    profile.push_str("; SECURITY: File write restrictions (deny-default mode)\n");
+    profile.push_str("; Block ALL file writes by default\n");
+    profile.push_str("(deny file-write*)\n");
+    profile.push('\n');
+
+    // Allow writing to isolated work directory (TMPDIR points here)
+    profile.push_str("; Allow writing to isolated work directory\n");
+    profile.push_str(&format!(
+        "(allow file-write* (subpath \"{}\"))\n",
+        work_dir_str
+    ));
+
+    // Allow writing to project root (parent of .skills) for skill outputs (e.g. xiaohongshu_thumbnail.png)
+    if let Some(project_root) = skill_dir.parent().and_then(|p| p.parent()) {
+        let project_root_str = project_root.to_string_lossy();
+        if !project_root_str.is_empty() && project_root != skill_dir {
+            profile.push_str("; Allow writing to project root for skill outputs\n");
+            profile.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                project_root_str
+            ));
+        }
+    }
+
+    // Allow writing to /var/folders for system temp files (Python, Node.js cache)
+    profile.push_str("; Allow writing to /var/folders for system temp files\n");
+    profile.push_str("(allow file-write* (subpath \"/var/folders\"))\n");
+    profile.push_str("(allow file-write* (subpath \"/private/var/folders\"))\n");
+    // L2 relaxed: allow ~/Library/Caches for Playwright, pip cache
+    if relaxed {
+        profile.push_str("(allow file-write* (regex #\"^/Users/[^/]+/Library/Caches\"))\n");
+    }
+    profile.push('\n');
+
+    // ============================================================
+    // SECURITY: Block high-risk IPC and kernel operations
+    // ============================================================
+    profile.push_str("; SECURITY: Block high-risk IPC and kernel operations\n");
+    profile.push_str("(deny mach-register)\n");
+    profile.push_str("(deny mach-priv-task-port)\n");
+    profile.push_str("(deny iokit-open)\n");
+    profile.push('\n');
+
+    // ============================================================
+    // ALLOW DEFAULT - For remaining operations (mach-lookup, sysctl, signal, etc.)
+    // ============================================================
+    profile.push_str(
+        "; Allow default for runtime compatibility (mach-lookup, sysctl, signal, etc.)\n",
+    );
+    profile.push_str("(allow default)\n\n");
+
+    // ============================================================
+    // ALLOW: Skill and environment directories
+    // ============================================================
+    profile.push_str("; Allow reading skill directory\n");
+    profile.push_str(&format!(
+        "(allow file-read* (subpath \"{}\"))\n",
+        skill_dir_str
+    ));
+
+    if !env_path.as_os_str().is_empty() && env_path.exists() {
+        let env_path_str = env_path.to_string_lossy();
+        profile.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            env_path_str
+        ));
+    }
+    if relaxed {
+        profile.push_str("(allow file-read* (regex #\"^/Users/[^/]+/Library/Caches\"))\n");
+        profile.push_str("(allow file-read* (subpath \"/usr\"))\n");
+        profile.push_str("(allow file-read* (subpath \"/opt/homebrew\"))\n");
+        profile.push_str("(allow file-read* (subpath \"/opt/local\"))\n");
+    }
+    profile.push('\n');
+
+    if config.network_enabled {
+        profile.push_str("; Network access enabled\n");
+        if config.network_outbound.is_empty() {
+            profile.push_str("(allow network-outbound)\n");
+        } else {
+            for host in &config.network_outbound {
+                if let Some(ips) = resolve_host_to_ips(host) {
+                    for ip in ips {
+                        profile.push_str(&format!(
+                            "(allow network-outbound (remote ip \"{}\"))\n",
+                            ip
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(profile)
+}
+
+/// Resolve a hostname to IP addresses
+#[allow(dead_code)] // called only from generate_sandbox_profile (test-only path)
+fn resolve_host_to_ips(host: &str) -> Option<Vec<String>> {
+    // Parse host:port format
+    let (hostname, port) = if let Some(idx) = host.rfind(':') {
+        let (h, p) = host.split_at(idx);
+        (h, p.trim_start_matches(':'))
+    } else {
+        (host, "443")
+    };
+
+    // Handle wildcard domains
+    if hostname.starts_with("*.") {
+        // For wildcard domains, we can't resolve them directly
+        // Return None and the caller should handle this case
+        return None;
+    }
+
+    // Try to resolve
+    let addr = format!("{}:{}", hostname, port);
+    match addr.as_str().to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<String> = addrs
+                .map(|a: std::net::SocketAddr| a.ip().to_string())
+                .collect();
+            if ips.is_empty() {
+                None
+            } else {
+                Some(ips)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn extract_python_framework_version_root(canonical_path: &str) -> Option<&str> {
+    for marker in ["Python.framework/Versions/", "Python3.framework/Versions/"] {
+        if let Some(fw_pos) = canonical_path.find(marker) {
+            let version_start = fw_pos + marker.len();
+            let after_versions = &canonical_path[version_start..];
+            if after_versions.is_empty() {
+                return None;
+            }
+
+            return Some(match after_versions.find('/') {
+                Some(slash) => &canonical_path[..version_start + slash],
+                None => canonical_path,
+            });
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_sandbox_profile() {
+        let skill_dir = Path::new("/tmp/test_skill");
+        let env_path = Path::new("");
+        let work_dir = Path::new("/tmp/work");
+
+        let config = SandboxConfig {
+            name: "test".to_string(),
+            entry_point: "main.py".to_string(),
+            language: "python".to_string(),
+            network_enabled: false,
+            network_outbound: Vec::new(),
+            uses_playwright: false,
+        };
+
+        let interpreter = Path::new("/usr/bin/python3");
+        let profile = generate_sandbox_profile(skill_dir, env_path, &config, work_dir, interpreter)
+            .expect("test sandbox profile generation should succeed");
+
+        assert!(profile.contains("(version 1)"));
+        assert!(profile.contains("/tmp/test_skill"));
+        assert!(profile.contains("(deny network*)"));
+        // Step 1: high-risk IPC/kernel operations are denied
+        assert!(profile.contains("(deny mach-register)"));
+        assert!(profile.contains("(deny mach-priv-task-port)"));
+        assert!(profile.contains("(deny iokit-open)"));
+        // Step 2: process-exec whitelist (only interpreter allowed)
+        assert!(profile.contains("(allow process-exec (literal \"/usr/bin/python3\"))"));
+        assert!(profile.contains("(deny process-exec)"));
+        // Step 2: process-fork denied by default
+        assert!(profile.contains("(deny process-fork)"));
+    }
+
+    #[test]
+    fn test_extract_python_framework_version_root_supports_python3_framework() {
+        assert_eq!(
+            extract_python_framework_version_root(
+                "/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+            ),
+            Some("/opt/homebrew/Cellar/python@3.13/3.13.2/Frameworks/Python.framework/Versions/3.13")
+        );
+        assert_eq!(
+            extract_python_framework_version_root(
+                "/Library/Frameworks/Python3.framework/Versions/3.12/bin/python3"
+            ),
+            Some("/Library/Frameworks/Python3.framework/Versions/3.12")
+        );
+        assert_eq!(
+            extract_python_framework_version_root("/usr/bin/python3"),
+            None
+        );
+    }
+}
