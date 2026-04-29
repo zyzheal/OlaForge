@@ -1,6 +1,6 @@
 [package]
 name = "olaforge-cli"
-version = "1.2.0"
+version = "2.0.0"
 edition = "2021"
 description = "OlaForge CLI - 安全沙箱执行引擎"
 authors = ["OlaForge Team"]

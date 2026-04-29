@@ -16,6 +16,7 @@ mod docker;
 mod audit_cmd;
 mod logging;
 mod templates;
+mod mcp;
 use config::Config;
 use sandbox::execute_in_sandbox;
 use skill::{Skill, list_skills};
@@ -25,6 +26,7 @@ use docker::{run_in_docker, list_images, check_docker, DockerConfig};
 use audit_cmd::run_audit;
 use logging::{log_execution, get_recent_logs, get_log_stats, init_log_manager};
 use templates::{list_templates, create_from_template};
+use mcp::run_mcp_server;
 
 #[derive(Parser)]
 #[command(name = "olaforge")]
@@ -199,6 +201,9 @@ enum Commands {
         #[arg(short, long, default_value = ".skills")]
         output: String,
     },
+
+    /// MCP 协议服务 (Claude Code 集成)
+    Mcp,
 
     /// 版本信息
     Version,
@@ -650,6 +655,10 @@ fn main_cli() -> Result<()> {
             } else {
                 print!("{{\"message\":\"使用 --list 查看模板，使用 --create <template_id> 创建技能\"}}");
             }
+        }
+
+        Commands::Mcp => {
+            run_mcp_server().ok();
         }
         
         Commands::Version => {
