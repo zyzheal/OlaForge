@@ -17,6 +17,7 @@ mod audit_cmd;
 mod logging;
 mod templates;
 mod mcp;
+mod validator;
 use config::Config;
 use sandbox::execute_in_sandbox;
 use skill::{Skill, list_skills};
@@ -27,6 +28,7 @@ use audit_cmd::run_audit;
 use logging::{log_execution, get_recent_logs, get_log_stats, init_log_manager};
 use templates::{list_templates, create_from_template};
 use mcp::run_mcp_server;
+use validator::InputValidator;
 
 #[derive(Parser)]
 #[command(name = "olaforge")]
@@ -469,43 +471,54 @@ fn main_cli() -> Result<()> {
             }
         }
         
-        Commands::Execute { code, language, security, timeout, no_sandbox } => {
+Commands::Execute { code, language, security, timeout, no_sandbox } => {
             if cli.verbose {
                 eprintln!("执行: {} (安全: {})", language, security);
                 eprintln!("超时: {}s", timeout);
                 eprintln!("沙箱: {}", if no_sandbox { "禁用" } else { "启用" });
             }
             
-            let effective_security = if no_sandbox { "disabled".to_string() } else { security };
-            let result = execute_in_sandbox(
-                &code,
-                &language,
-                timeout,
-                &effective_security,
-                config.sandbox.allow_network
-            )?;
-            
-            // 解析结果并记录日志
-            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&result) {
-                let log = logging::ExecutionLog {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    code: code.chars().take(500).collect(),
-                    language: language.clone(),
-                    security_level: effective_security.clone(),
-                    success: resp["success"].as_bool().unwrap_or(false),
-                    output: resp["output"].as_str().unwrap_or("").chars().take(1000).collect(),
-                    error: resp["error"].as_str().map(String::from),
-                    execution_time_ms: resp["execution_time_ms"].as_u64().unwrap_or(0),
-                    risk_level: resp["sandbox"]["risk_level"].as_str().unwrap_or("none").to_string(),
-                    issues_count: resp["sandbox"]["issues_count"].as_u64().unwrap_or(0) as usize,
-                };
-                log_execution(log);
+            // 输入验证
+            if let Err(e) = InputValidator::validate_code(&code, 100000) {
+                print!("{{\"error\":\"{}\",\"success\":false}}", e);
+            } else if let Err(e) = InputValidator::validate_language(&language) {
+                print!("{{\"error\":\"{}\",\"success\":false}}", e);
+            } else if let Err(e) = InputValidator::validate_security_level(&security) {
+                print!("{{\"error\":\"{}\",\"success\":false}}", e);
+            } else if let Err(e) = InputValidator::validate_timeout(timeout, 3600) {
+                print!("{{\"error\":\"{}\",\"success\":false}}", e);
+            } else {
+                let effective_security = if no_sandbox { "disabled".to_string() } else { security };
+                let result = execute_in_sandbox(
+                    &code,
+                    &language,
+                    timeout,
+                    &effective_security,
+                    config.sandbox.allow_network
+                )?;
+                
+                // 解析结果并记录日志
+                if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&result) {
+                    let log = logging::ExecutionLog {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        code: code.chars().take(500).collect(),
+                        language: language.clone(),
+                        security_level: effective_security.clone(),
+                        success: resp["success"].as_bool().unwrap_or(false),
+                        output: resp["output"].as_str().unwrap_or("").chars().take(1000).collect(),
+                        error: resp["error"].as_str().map(String::from),
+                        execution_time_ms: resp["execution_time_ms"].as_u64().unwrap_or(0),
+                        risk_level: resp["sandbox"]["risk_level"].as_str().unwrap_or("none").to_string(),
+                        issues_count: resp["sandbox"]["issues_count"].as_u64().unwrap_or(0) as usize,
+                    };
+                    logging::log_execution(log);
+                }
+                
+                print!("{}", result);
             }
-            
-            print!("{}", result);
         }
-        
+
         Commands::Run { skill_dir, input_json, goal, allow_network: _, sandbox_level: _ } => {
             if cli.verbose {
                 eprintln!("运行技能: {:?}", skill_dir);
