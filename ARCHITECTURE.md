@@ -586,5 +586,544 @@ OlaForge 整合了：
 
 ---
 
+## 十四、CLI 命令设计
+
+### 14.1 命令结构
+
+```
+olaforge <command> [options] [arguments]
+
+Commands:
+  chat         启动交互式对话
+  run          单次执行代码
+  config       配置管理
+  init         初始化项目
+  skill        Skill 管理
+  status       查看状态
+  logs         查看日志
+  version      版本信息
+  help         帮助信息
+```
+
+### 14.2 详细命令
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           CLI 命令详解                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  chat [options]                                                            │
+│  ─────────────────                                                         │
+│  交互式对话模式                                                            │
+│                                                                             │
+│  选项:                                                                     │
+│    -m, --model <name>      指定模型 (默认: claude-3-5-sonnet)              │
+│    -s, --security <level>  安全等级 L0-L3 (默认: L2)                       │
+│    --no-sandbox           禁用沙箱 (仅 L0)                                  │
+│    -v, --verbose          详细输出                                          │
+│                                                                             │
+│  示例:                                                                     │
+│    $ olaforge chat                                                        │
+│    $ olaforge chat -m gpt-4                                               │
+│    $ olaforge chat --security L3                                          │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  run <prompt> [options]                                                    │
+│  ──────────────────                                                        │
+│  单次执行模式                                                              │
+│                                                                             │
+│  选项:                                                                     │
+│    -m, --model <name>      指定模型                                         │
+│    -s, --security <level>  安全等级                                         │
+│    -t, --timeout <sec>     超时时间 (默认: 60)                              │
+│    -o, --output <path>     输出文件                                         │
+│                                                                             │
+│  示例:                                                                     │
+│    $ olaforge run "print('hello')"                                        │
+│    $ olaforge run "calculate fibonacci(10)" -t 30                         │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  config [action] [key] [value]                                             │
+│  ───────────────────────────                                               │
+│  配置管理                                                                  │
+│                                                                             │
+│  操作:                                                                     │
+│    set <key> <value>    设置配置                                            │
+│    get <key>            获取配置                                            │
+│    list                 列出所有配置                                        │
+│    reset                重置为默认                                          │
+│    export               导出配置                                            │
+│    import <path>        导入配置                                            │
+│                                                                             │
+│  示例:                                                                     │
+│    $ olaforge config set api_key sk-xxx                                    │
+│    $ olaforge config set model claude-3-5-sonnet                          │
+│    $ olaforge config list                                                  │
+│    $ olaforge config reset                                                 │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  skill [action] [options]                                                  │
+│  ────────────────────────                                                  │
+│  Skill 管理                                                                │
+│                                                                             │
+│  操作:                                                                     │
+│    list                   列出已安装 skill                                  │
+│    add <source>           添加 skill                                        │
+│    remove <name>          移除 skill                                        │
+│    info <name>            查看 skill 信息                                   │
+│    enable <name>          启用 skill                                        │
+│    disable <name>         禁用 skill                                        │
+│                                                                             │
+│  示例:                                                                     │
+│    $ olaforge skill list                                                   │
+│    $ olaforge skill add owner/repo                                         │
+│    $ olaforge skill add ./my-skill                                         │
+│    $ olaforge skill remove my-skill                                        │
+│                                                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  init [options]                                                            │
+│  ─────────────                                                             │
+│  初始化项目                                                                │
+│                                                                             │
+│  选项:                                                                     │
+│    --force                 强制初始化                                        │
+│    --template <name>      使用模板                                          │
+│    --dir <path>           指定目录 (默认: 当前)                             │
+│                                                                             │
+│  示例:                                                                     │
+│    $ olaforge init                                                         │
+│    $ olaforge init --template python                                       │
+│    $ olaforge init --dir ./my-project                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 十五、配置文件设计
+
+### 15.1 配置文件位置
+
+```
+~/.olaforge/
+├── config.yaml          # 主配置文件
+├── models.yaml          # 模型配置
+├── skills/              # 本地 skill 目录
+├── cache/               # 缓存目录
+├── logs/                # 日志目录
+└── memory/              # 记忆存储
+
+项目目录/
+├── .olaforge/           # 项目级配置 (可选)
+├── skills/              # 项目 skill
+└── .gitignore
+```
+
+### 15.2 主配置文件格式
+
+```yaml
+# ~/.olaforge/config.yaml
+version: "1.0"
+
+# 模型配置
+model:
+  provider: "openai"              # openai/anthropic/local
+  name: "claude-3-5-sonnet"       # 模型名称
+  api_key: "${OLA_API_KEY}"       # 环境变量引用
+  base_url: ""                    # 自定义 API 端点
+  timeout: 60                     # 请求超时 (秒)
+  max_retries: 3                  # 最大重试次数
+
+# 安全配置
+security:
+  level: "L2"                     # L0/L1/L2/L3
+  auto_level: true                # 自动选择安全等级
+  network_allowed: false          # 是否允许网络
+  file_write_allowed: false       # 是否允许写文件
+
+# 执行配置
+execution:
+  timeout: 60                     # 执行超时 (秒)
+  memory_limit: 4096              # 内存限制 (MB)
+  cpu_limit: 2                    # CPU 核心数
+  temp_dir: "/tmp/olaforge"      # 临时目录
+
+# 进化配置
+evolution:
+  enabled: true                   # 是否启用进化
+  auto_save: true                 # 自动保存
+  feedback_threshold: 0.8         # 反馈阈值
+  max_memory_items: 1000         # 最大记忆条目
+
+# 日志配置
+logging:
+  level: "info"                   # debug/info/warn/error
+  file: "~/.olaforge/logs/olaforge.log"
+  max_size: 10                    # 单个日志文件大小 (MB)
+  max_files: 5                    # 保留文件数
+
+# 高级配置
+advanced:
+  cache_enabled: true             # 启用缓存
+  preload_models: false           # 预加载模型
+  parallel_execution: false       # 并行执行
+  sandbox_engine: "bwrap"         # bwrap/firejail/none
+```
+
+### 15.3 环境变量
+
+| 变量名 | 说明 | 必填 |
+|--------|------|------|
+| `OLA_API_KEY` | API Key | 是 |
+| `OLA_BASE_URL` | 自定义 API 端点 | 否 |
+| `OLA_MODEL` | 默认模型 | 否 |
+| `OLA_SECURITY` | 默认安全等级 | 否 |
+| `OLA_CONFIG_PATH` | 配置文件路径 | 否 |
+| `OLA_NO_SANDBOX` | 禁用沙箱 | 否 |
+
+---
+
+## 十六、Skill 定义格式
+
+### 16.1 Skill 目录结构
+
+```
+my-skill/
+├── SKILL.md           # Skill 元数据 (必须)
+├── scripts/           # 脚本目录
+│   ├── main.py        # 主入口 (可选)
+│   ├── handler.py     # 处理器 (可选)
+│   └── utils.py       # 工具 (可选)
+├── references/        # 参考文档 (可选)
+│   └── api.md
+├── assets/            # 资源文件 (可选)
+│   └── icon.png
+└── tests/             # 测试 (可选)
+    └── test_skill.py
+```
+
+### 16.2 SKILL.md 格式
+
+```yaml
+---
+name: my-skill
+version: "1.0.0"
+description: "我的自定义 Skill，用于处理特定任务"
+author: your-name
+license: MIT
+compatibility: "olaforge >= 1.0.0"
+
+# 依赖声明
+dependencies:
+  python:
+    - requests>=2.28.0
+    - numpy>=1.21.0
+  system: []
+
+# 输入参数
+input:
+  query:
+    type: string
+    required: true
+    description: "用户查询"
+
+  options:
+    type: object
+    required: false
+    properties:
+      mode:
+        type: string
+        enum: [fast, accurate]
+        default: fast
+
+# 输出格式
+output:
+  type: object
+  properties:
+    result:
+      type: string
+      description: "执行结果"
+    confidence:
+      type: number
+      description: "置信度"
+
+# 信任级别
+trust:
+  level: "medium"              # low/medium/high
+  requires_confirmation: false
+  can_network: false
+  can_write_files: false
+
+# 性能配置
+performance:
+  timeout: 30
+  memory_limit: 512
+  cpu_priority: normal
+---
+
+# 详细描述
+
+这个 Skill 用于...
+
+## 使用示例
+
+```python
+result = run_skill("my-skill", {"query": "xxx"})
+```
+
+## 注意事项
+
+- 需要网络连接
+- 处理时间可能较长
+```
+
+---
+
+## 十七、SDK 设计
+
+### 17.1 Python SDK
+
+```python
+# 安装
+pip install olaforge
+
+# 使用示例
+from olaforge import OlaForge
+
+# 初始化
+client = OlaForge(
+    api_key="sk-xxx",
+    model="claude-3-5-sonnet",
+    security="L2"
+)
+
+# 方式1: 对话
+response = client.chat("帮我写个快速排序")
+print(response.text)
+
+# 方式2: 执行代码
+result = client.run_code(
+    "print(sum([1,2,3,4,5]))",
+    language="python"
+)
+print(result.output)
+
+# 方式3: 使用 Skill
+result = client.run_skill(
+    "my-skill",
+    {"query": "xxx"}
+)
+
+# 方式4: 流式对话
+for chunk in client.stream_chat("讲个故事"):
+    print(chunk, end="")
+```
+
+### 17.2 REST API
+
+```
+Base URL: http://localhost:7860/api/v1
+
+Endpoints:
+
+POST /chat
+  发送对话请求
+  
+  Request:
+  {
+    "message": "xxx",
+    "model": "claude-3-5-sonnet",
+    "security": "L2",
+    "stream": false
+  }
+  
+  Response:
+  {
+    "id": "msg_xxx",
+    "text": "xxx",
+    "usage": {...}
+  }
+
+POST /run
+  执行代码
+  
+  Request:
+  {
+    "code": "print('hello')",
+    "language": "python",
+    "security": "L2"
+  }
+
+GET /status
+  获取状态
+
+GET /config
+  获取配置
+
+PUT /config
+  更新配置
+
+POST /skill
+  执行 Skill
+```
+
+### 17.3 MCP 协议支持
+
+```json
+{
+  "name": "olaforge",
+  "version": "1.0.0",
+  "capabilities": {
+    "tools": true,
+    "resources": true,
+    "prompts": true
+  },
+  "tools": [
+    {
+      "name": "olaforge_run",
+      "description": "Execute code in a secure sandbox",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "code": {"type": "string"},
+          "language": {"type": "string", "enum": ["python", "javascript", "bash"]},
+          "security": {"type": "string", "enum": ["L0", "L1", "L2", "L3"]}
+        },
+        "required": ["code"]
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 十八、错误处理
+
+### 18.1 错误码体系
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           错误码体系                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  格式: OLA-XXX-Y                                                          │
+│                                                                             │
+│  XXX: 模块代码                                                             │
+│  Y:  错误类型 (1=参数, 2=执行, 3=安全, 4=系统)                              │
+│                                                                             │
+│  通用错误 (000)                                                            │
+│  ───────────────                                                           │
+│  OLA-000-1  参数错误                                                        │
+│  OLA-000-2  执行超时                                                        │
+│  OLA-000-3  权限不足                                                        │
+│  OLA-000-4  系统错误                                                        │
+│                                                                             │
+│  配置模块 (100)                                                            │
+│  ───────────────                                                           │
+│  OLA-100-1  配置项不存在                                                    │
+│  OLA-100-2  配置格式错误                                                    │
+│  OLA-100-3  API Key 无效                                                    │
+│                                                                             │
+│  执行模块 (200)                                                            │
+│  ───────────────                                                           │
+│  OLA-200-1  代码执行超时                                                    │
+│  OLA-200-2  内存超限                                                        │
+│  OLA-200-3  CPU 超限                                                        │
+│  OLA-200-4  进程崩溃                                                        │
+│                                                                             │
+│  安全模块 (300)                                                            │
+│  ───────────────                                                           │
+│  OLA-300-1  沙箱初始化失败                                                  │
+│  OLA-300-2  权限被拒绝                                                      │
+│  OLA-300-3  危险操作被拦截                                                  │
+│  OLA-300-4  网络访问被拒绝                                                  │
+│  OLA-300-5  文件访问被拒绝                                                  │
+│                                                                             │
+│  模型模块 (400)                                                            │
+│  ───────────────                                                           │
+│  OLA-400-1  模型加载失败                                                    │
+│  OLA-400-2  API 请求失败                                                    │
+│  OLA-400-3  模型响应错误                                                    │
+│  OLA-400-4  Token 超限                                                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 18.2 错误响应格式
+
+```json
+{
+  "error": {
+    "code": "OLA-300-3",
+    "message": "危险操作被拦截",
+    "detail": "命令 'rm -rf /' 被安全策略拦截",
+    "recoverable": false,
+    "suggestion": "请移除危险操作后重试"
+  },
+  "request_id": "req_xxx"
+}
+```
+
+### 18.3 重试策略
+
+```python
+# 默认重试配置
+retry_config = {
+    "max_retries": 3,
+    "backoff_factor": 2,        # 指数退避
+    "initial_delay": 1,         # 初始延迟 (秒)
+    "max_delay": 60,            # 最大延迟 (秒)
+    "retry_on": [
+        "OLA-000-4",            # 系统错误
+        "OLA-400-2",            # API 请求失败
+    ]
+}
+
+# 示例
+@retry(max_retries=3, backoff=2)
+def api_call():
+    pass
+```
+
+---
+
+## 十九、功能检查清单
+
+### 19.1 核心功能
+
+| 功能 | 状态 | 优先级 |
+|------|------|--------|
+| CLI 命令 chat | ✅ 已设计 | P0 |
+| CLI 命令 run | ✅ 已设计 | P0 |
+| CLI 命令 config | ✅ 已设计 | P0 |
+| CLI 命令 init | ✅ 已设计 | P1 |
+| CLI 命令 skill | ✅ 已设计 | P1 |
+| 配置文件格式 | ✅ 已设计 | P0 |
+| 环境变量支持 | ✅ 已设计 | P0 |
+| Skill 定义格式 | ✅ 已设计 | P1 |
+| Python SDK | ✅ 已设计 | P1 |
+| REST API | ✅ 已设计 | P2 |
+| MCP 协议 | ✅ 已设计 | P2 |
+| 错误码体系 | ✅ 已设计 | P1 |
+| 重试策略 | ✅ 已设计 | P1 |
+
+### 19.2 后续完善
+
+| 功能 | 说明 |
+|------|------|
+| Web UI | 桌面应用界面 |
+| VSCode 插件 | IDE 集成 |
+| API 详细规范 | OpenAPI 规范 |
+| 测试用例 | 单元测试 + E2E |
+
+---
+
 *文档创建时间: 2026-04-29*
+*最后更新: 2026-04-29*
+*版本: v1.1*
 *版本: v1.0*
