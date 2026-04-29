@@ -1,6 +1,6 @@
 [package]
 name = "olaforge-cli"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "OlaForge CLI - 安全沙箱执行引擎"
 authors = ["OlaForge Team"]
@@ -14,7 +14,7 @@ path = "src/main.rs"
 olaforge-core = { path = "../olaforge-core" }
 olaforge-fs = { path = "../olaforge-fs" }
 olaforge-executor = { path = "../olaforge-executor" }
-olaforge-sandbox = { path = "../olaforge-sandbox" }
+olaforge-sandbox = { path = "../olaforge-sandbox", features = ["audit"] }
 olaforge-evolution = { path = "../olaforge-evolution" }
 
 clap = { version = "4.5", features = ["derive"] }

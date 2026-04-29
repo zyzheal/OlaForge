@@ -13,12 +13,14 @@ mod skill;
 mod webui;
 mod chat;
 mod docker;
+mod audit_cmd;
 use config::Config;
 use sandbox::execute_in_sandbox;
 use skill::{Skill, list_skills};
 use webui::start_web_ui;
 use chat::run_interactive;
 use docker::{run_in_docker, list_images, check_docker, DockerConfig};
+use audit_cmd::run_audit;
 
 #[derive(Parser)]
 #[command(name = "olaforge")]
@@ -51,6 +53,10 @@ enum Commands {
         /// 非交互模式 (单轮对话)
         #[arg(short, long)]
         prompt: Option<String>,
+
+        /// Agent 模式 (支持自动代码执行)
+        #[arg(long, default_value_t = false)]
+        agent: bool,
     },
 
     /// 执行代码
@@ -144,6 +150,17 @@ enum Commands {
 
     /// 健康检查
     Health,
+
+    /// 依赖安全审计 (OSV)
+    Audit {
+        /// 技能目录路径
+        #[arg(short, long)]
+        path: Option<String>,
+
+        /// 输出格式 (json/text)
+        #[arg(short, long, default_value = "json")]
+        format: String,
+    },
 
     /// 版本信息
     Version,
@@ -389,7 +406,7 @@ fn main_cli() -> Result<()> {
     let config = Config::load(&cli.config).unwrap_or_default();
 
     match cli.command {
-        Commands::Chat { system, model, prompt } => {
+        Commands::Chat { system, model, prompt, agent } => {
             if let Some(p) = prompt {
                 // 单轮对话模式
                 let mut session = chat::ChatSession::new(model);
@@ -402,7 +419,7 @@ fn main_cli() -> Result<()> {
                 }
             } else {
                 // 交互模式
-                run_interactive(system.as_deref())?;
+                run_interactive(system.as_deref(), agent)?;
             }
         }
         
@@ -537,6 +554,16 @@ fn main_cli() -> Result<()> {
         
         Commands::Health => {
             print!("{{\"status\":\"healthy\",\"version\":\"1.0.0\"}}");
+        }
+
+        Commands::Audit { path, format } => {
+            if cli.verbose {
+                eprintln!("执行依赖安全审计...");
+            }
+            match run_audit(path.as_deref(), &format) {
+                Ok(result) => print!("{}", result),
+                Err(e) => print!("{{\"error\":\"{}\"}}", e),
+            }
         }
         
         Commands::Version => {

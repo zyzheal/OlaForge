@@ -2,6 +2,59 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, Write};
+use std::process::Command;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+pub const AGENT_TOOLS: &[&str] = &[
+    r#"{
+        "type": "function",
+        "function": {
+            "name": "execute_code",
+            "description": "在沙箱中安全地执行代码",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "要执行的代码"},
+                    "language": {"type": "string", "enum": ["python", "javascript", "bash", "ruby", "go"], "description": "编程语言"},
+                    "timeout": {"type": "number", "description": "超时秒数", "default": 60}
+                },
+                "required": ["code", "language"]
+            }
+        }
+    }"#,
+    r#"{
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "列出所有可用的技能",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }"#,
+    r#"{
+        "type": "function",
+        "function": {
+            "name": "run_skill",
+            "description": "执行一个技能",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "技能名称"},
+                    "input": {"type": "string", "description": "输入参数 (JSON)"}
+                },
+                "required": ["skill_name"]
+            }
+        }
+    }"#,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -144,25 +197,118 @@ impl ChatSession {
     pub fn history_len(&self) -> usize {
         self.messages.len()
     }
+
+    pub fn execute_tool(&self, tool_name: &str, arguments: &str) -> Result<String> {
+        match tool_name {
+            "execute_code" => {
+                let args: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|e| anyhow::anyhow!("Invalid arguments: {}", e))?;
+                
+                let code = args["code"].as_str().ok_or_else(|| anyhow::anyhow!("Missing code"))?;
+                let language = args["language"].as_str().unwrap_or("python");
+                let timeout = args["timeout"].as_u64().unwrap_or(60) as u64;
+                
+                let output = Command::new("timeout")
+                    .arg(format!("{}", timeout))
+                    .arg(get_interpreter(language))
+                    .arg(get_language_flag(language))
+                    .arg(code)
+                    .output()?;
+                
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                
+                if output.status.success() {
+                    Ok(format!("执行成功:\n{}", stdout))
+                } else {
+                    Ok(format!("执行失败 (退出码: {:?}):\n{}\n{}", 
+                        output.status.code(), stdout, stderr))
+                }
+            }
+            "list_skills" => {
+                Ok("技能列表: (使用 olaforge skills 查看)".to_string())
+            }
+            "run_skill" => {
+                Ok("技能执行: (使用 olaforge run <skill> 查看)".to_string())
+            }
+            _ => Err(anyhow::anyhow!("未知工具: {}", tool_name))
+        }
+    }
 }
 
-pub fn run_interactive(system_prompt: Option<&str>) -> Result<()> {
+fn get_interpreter(language: &str) -> &str {
+    match language {
+        "python" | "python3" => "python3",
+        "javascript" | "js" => "node",
+        "bash" | "sh" => "bash",
+        "ruby" => "ruby",
+        "go" => "go",
+        _ => "sh",
+    }
+}
+
+fn get_language_flag(language: &str) -> &str {
+    match language {
+        "javascript" | "js" => "-e",
+        _ => "-c",
+    }
+}
+
+pub fn run_interactive(system_prompt: Option<&str>, agent_mode: bool) -> Result<()> {
+    let mode_desc = if agent_mode {
+        "Agent 模式 (自动执行代码)"
+    } else {
+        "对话模式"
+    };
+    
     println!("
 ╔═══════════════════════════════════════════╗
 ║         OlaForge Chat Mode                ║
 ║  AI 助手 + 安全沙箱执行                    ║
 ╠═══════════════════════════════════════════╣
+║  模式: {}                          ║
 ║  输入代码我将执行                          ║
 ║  输入 :clear 清除对话                     ║
 ║  输入 :quit 退出                          ║
 ║  输入 :exec <code> 执行代码               ║
+║  输入 :agent 切换 Agent 模式              ║
 ╚═══════════════════════════════════════════╝
-");
+", mode_desc);
 
         let mut session = ChatSession::new("gpt-3.5-turbo".to_string());
     
+    let default_system = if agent_mode {
+        r#"你是一个智能编程助手，可以使用工具来执行代码。
+
+## 可用工具
+
+### execute_code
+在沙箱中安全地执行代码。当用户要求运行代码时，必须使用此工具。
+参数:
+- code: 要执行的代码 (string)
+- language: 语言 (python/javascript/bash/ruby/go)
+- timeout: 超时秒数 (可选，默认60)
+
+### list_skills
+列出所有可用的技能。
+
+### run_skill
+执行一个预定义的技能。
+
+## 行为规则
+1. 用户要求执行代码时，立即使用 execute_code 工具执行
+2. 返回执行结果给用户
+3. 如果代码有错误，解释错误并提供修复建议
+4. 保持对话简洁"#.
+to_string()
+    } else {
+        "你是一个智能编程助手。可以用 olaforge execute 命令执行代码。".to_string()
+    };
+    
     if let Some(prompt) = system_prompt {
         session.add_system_prompt(prompt);
+    } else {
+        session.add_system_prompt(&default_system);
     }
 
     loop {

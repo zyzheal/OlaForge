@@ -66,26 +66,81 @@ impl SandboxExecutor {
     }
 
     pub fn get_issues(&self, code: &str, language: &str) -> Vec<String> {
-        let _issues: Vec<String> = Vec::new();
+        let mut issues = Vec::new();
         
-        // 安全扫描
-        match self.scan(code, language) {
-            Ok(result) => {
-                result.issues.iter()
-                    .filter(|i| i.severity == SecuritySeverity::High || i.severity == SecuritySeverity::Critical)
-                    .map(|i| {
-                        let severity_str = match i.severity {
-                            SecuritySeverity::Critical => "CRITICAL",
-                            SecuritySeverity::High => "HIGH", 
-                            SecuritySeverity::Medium => "MEDIUM",
-                            SecuritySeverity::Low => "LOW",
-                        };
-                        format!("[{}] {}", severity_str, i.description)
-                    })
-                    .collect()
+        // 安全扫描 - 从扫描器获取结果
+        if let Ok(result) = self.scan(code, language) {
+            if !result.is_safe {
+                for issue in &result.issues {
+                    let severity_str = match issue.severity {
+                        SecuritySeverity::Critical => "CRITICAL",
+                        SecuritySeverity::High => "HIGH", 
+                        SecuritySeverity::Medium => "MEDIUM",
+                        SecuritySeverity::Low => "LOW",
+                    };
+                    issues.push(format!("[{}] {}", severity_str, issue.description));
+                }
             }
-            Err(e) => vec![format!("扫描错误: {}", e)],
         }
+        
+        // 备用检测：直接检测常见危险模式
+        let backup_issues = self.backup_detection(code, language);
+        for issue in backup_issues {
+            if !issues.iter().any(|i| i.contains(&issue[..issue.len().min(20)])) {
+                issues.push(issue);
+            }
+        }
+        
+        issues
+    }
+    
+    fn backup_detection(&self, code: &str, language: &str) -> Vec<String> {
+        let mut issues = Vec::new();
+        
+        match language {
+            "python" => {
+                if code.contains("eval(") || code.contains("exec(") {
+                    issues.push("[CRITICAL] eval/exec detected - arbitrary code execution".to_string());
+                }
+                if code.contains("subprocess.") && (code.contains("call(") || code.contains("run(") || code.contains("Popen(")) {
+                    issues.push("[HIGH] subprocess execution detected".to_string());
+                }
+                if code.contains("os.system(") || code.contains("os.popen(") {
+                    issues.push("[HIGH] os.system/popen detected - shell command execution".to_string());
+                }
+                if code.contains("pickle.load") || code.contains("marshal.load") {
+                    issues.push("[HIGH] Unsafe deserialization detected".to_string());
+                }
+                if code.contains("__import__(\"os\")") || code.contains("__import__('os')") {
+                    issues.push("[HIGH] Dynamic os module import - potential code execution".to_string());
+                }
+            },
+            "javascript" | "js" => {
+                if code.contains("eval(") || code.contains("new Function(") {
+                    issues.push("[CRITICAL] eval/Function detected - arbitrary code execution".to_string());
+                }
+                if code.contains("child_process") && (code.contains("exec(") || code.contains("spawn(") || code.contains("execSync(")) {
+                    issues.push("[HIGH] child_process execution detected".to_string());
+                }
+                if code.contains("require('vm')") || code.contains("require(\"vm\")") {
+                    issues.push("[HIGH] vm module detected - code sandbox escape risk".to_string());
+                }
+            },
+            "bash" | "sh" => {
+                if code.contains("eval ") || code.contains("exec ") {
+                    issues.push("[CRITICAL] eval/exec detected".to_string());
+                }
+                if code.contains("| bash") || code.contains("| sh") {
+                    issues.push("[HIGH] Pipe to shell detected".to_string());
+                }
+                if code.contains("curl ") && code.contains("|") {
+                    issues.push("[HIGH] Download and pipe to shell detected".to_string());
+                }
+            },
+            _ => {}
+        }
+        
+        issues
     }
 }
 
@@ -137,6 +192,17 @@ pub fn execute_in_sandbox(
     let elapsed = start.elapsed().as_millis() as u64;
 
     if !scan_passed {
+        let risk_level = if security_issues.iter().any(|i| i.contains("CRITICAL")) {
+            "critical"
+        } else if security_issues.iter().any(|i| i.contains("HIGH")) {
+            "high"
+        } else if security_issues.iter().any(|i| i.contains("MEDIUM")) {
+            "medium"
+        } else {
+            "low"
+        };
+        let recommendations = generate_recommendations(&security_issues);
+        
         return Ok(serde_json::to_string(&json!({
             "success": false,
             "output": "",
@@ -148,9 +214,13 @@ pub fn execute_in_sandbox(
                 "enabled": true,
                 "level": security_level,
                 "scanned": true,
-                "passed": false
+                "passed": false,
+                "risk_level": risk_level,
+                "issues_count": security_issues.len(),
+                "recommendations": recommendations
             },
-            "language": language
+            "language": language,
+            "scan_timestamp": chrono::Utc::now().to_rfc3339()
         }))?);
     }
 
@@ -179,6 +249,24 @@ pub fn execute_in_sandbox(
         Err(_) => -1,
     };
 
+    let risk_level = if security_issues.iter().any(|i| i.contains("CRITICAL")) {
+        "critical"
+    } else if security_issues.iter().any(|i| i.contains("HIGH")) {
+        "high"
+    } else if security_issues.iter().any(|i| i.contains("MEDIUM")) {
+        "medium"
+    } else if !security_issues.is_empty() {
+        "low"
+    } else {
+        "none"
+    };
+
+    let recommendations = if !security_issues.is_empty() {
+        generate_recommendations(&security_issues)
+    } else {
+        vec![]
+    };
+
     let response = json!({
         "success": exit_code == 0,
         "output": stdout,
@@ -190,9 +278,13 @@ pub fn execute_in_sandbox(
             "level": security_level,
             "scanned": true,
             "passed": scan_passed,
-            "issues": security_issues
+            "risk_level": risk_level,
+            "issues_count": security_issues.len(),
+            "issues": security_issues,
+            "recommendations": recommendations
         },
-        "language": language
+        "language": language,
+        "scan_timestamp": chrono::Utc::now().to_rfc3339()
     });
 
     Ok(serde_json::to_string(&response)?)
@@ -252,4 +344,40 @@ fn check_filesystem_access(code: &str, language: &str) -> Vec<String> {
     }
     
     issues
+}
+
+fn generate_recommendations(issues: &[String]) -> Vec<String> {
+    let mut recommendations = Vec::new();
+    
+    for issue in issues {
+        if issue.contains("CRITICAL") || issue.contains("HIGH") {
+            if issue.contains("eval(") {
+                recommendations.push("避免使用 eval()，改用安全的解析方法".to_string());
+            }
+            if issue.contains("subprocess") {
+                recommendations.push("对用户输入进行严格验证后再传递给 subprocess".to_string());
+            }
+            if issue.contains("__import__") {
+                recommendations.push("使用静态导入而非动态导入".to_string());
+            }
+            if issue.contains("socket") {
+                recommendations.push("如需网络通信，请使用沙箱的网络控制功能".to_string());
+            }
+            if issue.contains("os.remove") || issue.contains("rm -rf") {
+                recommendations.push("避免直接删除文件，使用临时目录和自动清理".to_string());
+            }
+        }
+        
+        if issue.contains("MEDIUM") || issue.contains("FILESYSTEM") {
+            if issue.contains("读取系统配置文件") || issue.contains("/etc") {
+                recommendations.push("避免直接读取系统配置文件，考虑使用应用配置".to_string());
+            }
+        }
+    }
+    
+    // 去重
+    recommendations.sort();
+    recommendations.dedup();
+    
+    recommendations
 }
