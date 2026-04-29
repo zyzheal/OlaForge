@@ -1,0 +1,101 @@
+{
+  "name": "olaforge-code-runner",
+  "displayName": "OlaForge Code Runner",
+  "description": "Run code in a secure sandbox using OlaForge",
+  "version": "2.0.0",
+  "publisher": "olaforge",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "activationEvents": [
+    "onLanguage:python",
+    "onLanguage:javascript",
+    "onLanguage:typescript",
+    "onLanguage:bash",
+    "onCommand:olaforge.runCode"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "olaforge.runCode",
+        "title": "Run Code in OlaForge Sandbox",
+        "category": "OlaForge"
+      },
+      {
+        "command": "olaforge.runSelection",
+        "title": "Run Selection in OlaForge Sandbox",
+        "category": "OlaForge"
+      },
+      {
+        "command": "olaforge.setSecurityLevel",
+        "title": "Set Security Level",
+        "category": "OlaForge"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "olaforge.runCode",
+        "key": "ctrl+shift+r",
+        "mac": "cmd+shift+r",
+        "when": "editorTextFocus"
+      }
+    ],
+    "configuration": {
+      "title": "OlaForge",
+      "properties": {
+        "olaforge.securityLevel": {
+          "type": "string",
+          "enum": ["L0", "L1", "L2", "L3"],
+          "default": "L2",
+          "description": "Security level for code execution"
+        },
+        "olaforge.timeout": {
+          "type": "number",
+          "default": 60,
+          "description": "Execution timeout in seconds"
+        },
+        "olaforge.binaryPath": {
+          "type": "string",
+          "default": "olaforge",
+          "description": "Path to OlaForge binary"
+        }
+      }
+    },
+    "languages": [
+      {
+        "id": "python",
+        "extensions": [".py"]
+      },
+      {
+        "id": "javascript",
+        "extensions": [".js", ".mjs"]
+      },
+      {
+        "id": "typescript",
+        "extensions": [".ts"]
+      },
+      {
+        "id": "bash",
+        "extensions": [".sh", ".bash"]
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.70.0",
+    "typescript": "^4.9.0"
+  },
+  "dependencies": {
+    "vscode": "^1.70.0"
+  }
+}
