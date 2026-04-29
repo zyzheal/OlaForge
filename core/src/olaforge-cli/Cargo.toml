@@ -1,6 +1,6 @@
 [package]
 name = "olaforge-cli"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "OlaForge CLI - 安全沙箱执行引擎"
 authors = ["OlaForge Team"]
@@ -30,3 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 serde_yaml = "0.9"
 dirs = "5"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
+lazy_static = "1.4"

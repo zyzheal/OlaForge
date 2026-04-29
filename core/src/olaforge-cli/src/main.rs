@@ -14,6 +14,8 @@ mod webui;
 mod chat;
 mod docker;
 mod audit_cmd;
+mod logging;
+mod templates;
 use config::Config;
 use sandbox::execute_in_sandbox;
 use skill::{Skill, list_skills};
@@ -21,6 +23,8 @@ use webui::start_web_ui;
 use chat::run_interactive;
 use docker::{run_in_docker, list_images, check_docker, DockerConfig};
 use audit_cmd::run_audit;
+use logging::{log_execution, get_recent_logs, get_log_stats, init_log_manager};
+use templates::{list_templates, create_from_template};
 
 #[derive(Parser)]
 #[command(name = "olaforge")]
@@ -160,6 +164,40 @@ enum Commands {
         /// 输出格式 (json/text)
         #[arg(short, long, default_value = "json")]
         format: String,
+    },
+
+    /// 查看执行日志
+    Logs {
+        /// 显示最近 N 条日志
+        #[arg(short, long, default_value_t = 10)]
+        limit: usize,
+
+        /// 显示统计信息
+        #[arg(short, long)]
+        stats: bool,
+    },
+
+    /// 技能模板
+    Templates {
+        /// 列出模板
+        #[arg(short, long)]
+        list: bool,
+
+        /// 从模板创建技能
+        #[arg(short, long)]
+        create: Option<String>,
+
+        /// 技能名称
+        #[arg(long)]
+        name: Option<String>,
+
+        /// 技能描述
+        #[arg(long)]
+        description: Option<String>,
+
+        /// 输出目录
+        #[arg(short, long, default_value = ".skills")]
+        output: String,
     },
 
     /// 版本信息
@@ -404,6 +442,9 @@ fn main_cli() -> Result<()> {
     let cli = Cli::parse();
     
     let config = Config::load(&cli.config).unwrap_or_default();
+    
+    // 初始化日志系统
+    init_log_manager(true);
 
     match cli.command {
         Commands::Chat { system, model, prompt, agent } => {
@@ -438,6 +479,25 @@ fn main_cli() -> Result<()> {
                 &effective_security,
                 config.sandbox.allow_network
             )?;
+            
+            // 解析结果并记录日志
+            if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&result) {
+                let log = logging::ExecutionLog {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    code: code.chars().take(500).collect(),
+                    language: language.clone(),
+                    security_level: effective_security.clone(),
+                    success: resp["success"].as_bool().unwrap_or(false),
+                    output: resp["output"].as_str().unwrap_or("").chars().take(1000).collect(),
+                    error: resp["error"].as_str().map(String::from),
+                    execution_time_ms: resp["execution_time_ms"].as_u64().unwrap_or(0),
+                    risk_level: resp["sandbox"]["risk_level"].as_str().unwrap_or("none").to_string(),
+                    issues_count: resp["sandbox"]["issues_count"].as_u64().unwrap_or(0) as usize,
+                };
+                log_execution(log);
+            }
+            
             print!("{}", result);
         }
         
@@ -563,6 +623,32 @@ fn main_cli() -> Result<()> {
             match run_audit(path.as_deref(), &format) {
                 Ok(result) => print!("{}", result),
                 Err(e) => print!("{{\"error\":\"{}\"}}", e),
+            }
+        }
+
+        Commands::Logs { limit, stats } => {
+            if stats {
+                let stats = get_log_stats();
+                print!("{}", serde_json::to_string(&stats).unwrap_or_default());
+            } else {
+                let logs = get_recent_logs(limit);
+                print!("{}", serde_json::to_string(&logs).unwrap_or_default());
+            }
+        }
+
+        Commands::Templates { list, create, name, description, output } => {
+            if list {
+                let templates = list_templates();
+                print!("{}", serde_json::to_string(&templates).unwrap_or_default());
+            } else if let Some(template_id) = create {
+                let skill_name = name.unwrap_or_else(|| "new-skill".to_string());
+                let skill_desc = description.unwrap_or_else(|| "A new skill".to_string());
+                match create_from_template(&template_id, &output, &skill_name, &skill_desc) {
+                    Ok(msg) => print!("{{\"success\":true,\"message\":\"{}\"}}", msg),
+                    Err(e) => print!("{{\"error\":\"{}\"}}", e),
+                }
+            } else {
+                print!("{{\"message\":\"使用 --list 查看模板，使用 --create <template_id> 创建技能\"}}");
             }
         }
         
