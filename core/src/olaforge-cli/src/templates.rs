@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub const DEFAULT_TEMPLATES: &[(&str, &str, &str)] = &[
     ("python-script", "Python 脚本", r#"#!/usr/bin/env python3
